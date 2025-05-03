@@ -10,7 +10,6 @@ import asyncio
 import logging
 import os
 import sys
-import io
 from io import BytesIO
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -20,25 +19,16 @@ from typing import Optional, Tuple, Dict, Any, List
 
 # Import Telegram components
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-    Application,
-    PicklePersistence,
-    TypeHandler
-)
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, ContextTypes,
+    filters, Application, PicklePersistence, TypeHandler
+)
 from telegram.error import NetworkError, TelegramError, TimedOut
 
 # Import Google API components
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -49,6 +39,9 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Add after load_dotenv()
+print(f"Debug - TOKEN env var exists: {'Yes' if os.getenv('TELEGRAM_BOT_TOKEN') else 'No'}")
+
 # ---------------------------- Constants & Configuration ----------------------------
 # States for the ConversationHandler
 CATEGORY, STRAIN_TYPE, BROWSE_BY, PRODUCT_SELECTION, QUANTITY, CONFIRM, DETAILS, CONFIRM_DETAILS, PAYMENT, TRACKING = range(10)
@@ -58,11 +51,16 @@ ADMIN_SEARCH, ADMIN_TRACKING = 10, 11
 TRACK_ORDER = 1
 
 # Support admin user ID (the Telegram user ID that will receive support requests)
-SUPPORT_ADMIN_ID = "123456789"  # Replace with the actual Telegram user ID of your support admin
-SUPPORT_ADMIN_USERNAME = "your_support_username"  # Replace with the actual username (without @)
+SUPPORT_ADMIN_ID = os.getenv("SUPPORT_ADMIN_ID", "123456789")
+SUPPORT_ADMIN_USERNAME = os.getenv("SUPPORT_ADMIN_USERNAME", "your_support_username")
 
-# Get configuration from environment variables or use defaults
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7870716772:AAFn8Gjay6Ok6a3YeqU1WIZdmixQbMCHfiI")
+# Get configuration from environment variables
+TOKEN = os.getenv("7870716772:AAGsV84i-MLpHS7X-rT5k6dl767mhi7sNME")
+if not TOKEN:
+    print("Error: TELEGRAM_BOT_TOKEN environment variable not set")
+    logging.error("TELEGRAM_BOT_TOKEN environment variable not set")
+    sys.exit(1)
+    
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "5167750837"))
 GCASH_NUMBER = os.getenv("GCASH_NUMBER", "09171234567")
 
@@ -120,38 +118,19 @@ EMOJI = {
     "update": "💫"
 }
 
+# Add additional emojis if not present
 if "restart" not in EMOJI:
-        EMOJI.update({
-            "restart": "🔄",
-            "help": "❓",
-            "home": "🏠",
-            "browse": "🛒",
-            "order": "📦",
-            "clock": "⏰",
-            "error": "❌",
-            "warning": "⚠️",
-            "success": "✅",
-            "alert": "🚨",
-            "payment": "💳",
-            "id": "🔢",
-            "customer": "👤",
-            "money": "💰",
-            "date": "📅",
-            "phone": "📱",
-            "address": "🏠",
-            "status": "📊",
-            "link": "🔗",
-            "search": "🔍",
-            "screenshot": "📸",
-            "update": "🔄",
-            "cart": "🛒",
-            "back": "⬅️",
-            "info": "ℹ️",
-            "package": "📦",
-            "truck": "🚚",
-            "party": "🎉",
-            "support": "🧑‍💼"
-        })
+    EMOJI.update({
+        "restart": "🔄",
+        "help": "❓",
+        "home": "🏠",
+        "browse": "🛒",
+        "clock": "⏰", 
+        "package": "📦",
+        "truck": "🚚",
+        "party": "🎉",
+        "support": "🧑‍💼"
+    })
 
 # ---------------------------- Product Dictionary ----------------------------
 PRODUCTS = {
@@ -357,7 +336,7 @@ SHEET_COLUMN_INDICES = {name: idx+1 for idx, name in enumerate(SHEET_HEADERS)}
 
 # ---------------------------- Regular Expressions ----------------------------
 REGEX = {
-    "shipping_details": r"^(?P<name>[\w\s\.]+)\s*/\s*(?P<address>[\w\s,\.\-\#\/]+)\s*/\s*(?P<contact>\+?[\d\s\-]{10,15})$",
+    "shipping_details": r"^(?P<n>[\w\s\.]+)\s*/\s*(?P<address>[\w\s,\.\-\#\/]+)\s*/\s*(?P<contact>\+?[\d\s\-]{10,15})$",
     "quantity": r"(\d+)"
 }
 
@@ -396,27 +375,19 @@ def setup_logging():
     """
     # Create logs directory if it doesn't exist
     log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-        
-    # Create different loggers for different concerns
-    loggers = {
-        "main": logging.getLogger("main"),
-        "orders": logging.getLogger("orders"),
-        "payments": logging.getLogger("payments"),
-        "errors": logging.getLogger("errors"),
-        "admin": logging.getLogger("admin")
-    }
+    os.makedirs(log_dir, exist_ok=True)
     
-    if "performance" not in loggers:
-        # Create additional loggers if they don't exist yet
-        loggers.update({
-            "performance": create_logger("performance", "performance.log"),
-            "status": create_logger("status", "status.log")
-        })
-
+    # Define all required loggers
+    logger_names = [
+        "main", "orders", "payments", "errors", "admin", 
+        "performance", "status", "users", "security"
+    ]
+    
+    loggers = {}
+    
     # Configure each logger
-    for name, logger in loggers.items():
+    for name in logger_names:
+        logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)
         
         # Create rotating file handler (10 files, 5MB each)
@@ -428,7 +399,8 @@ def setup_logging():
         
         # Create formatter
         formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt='%Y-%m-%d %H:%M:%S'
         )
         handler.setFormatter(formatter)
         
@@ -440,74 +412,10 @@ def setup_logging():
         console.setLevel(logging.INFO)
         console.setFormatter(formatter)
         logger.addHandler(console)
-    
-    return loggers
-
-def create_logger(name: str, log_file: str, log_level=logging.INFO) -> logging.Logger:
-    """
-    Create a logger with the specified name and file.
-    
-    Args:
-        name: Name of the logger
-        log_file: Path to the log file
-        log_level: Logging level (default: logging.INFO)
         
-    Returns:
-        logging.Logger: Configured logger instance
-    """
-    # Create logs directory if it doesn't exist
-    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
+        loggers[name] = logger
     
-    # Create full path to log file
-    log_path = os.path.join(logs_dir, log_file)
-    
-    # Create logger
-    logger = logging.getLogger(name)
-    logger.setLevel(log_level)
-    
-    # Check if logger already has handlers to prevent duplicates
-    if not logger.handlers:
-        # Create rotating file handler (10MB max size, keep 5 backup files)
-        file_handler = RotatingFileHandler(
-            log_path, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
-        )
-        
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        
-        # Set formatter for handler
-        file_handler.setFormatter(formatter)
-        
-        # Add handler to logger
-        logger.addHandler(file_handler)
-    
-    return logger
-
-def initialize_loggers() -> dict:
-    """
-    Initialize all required loggers for the application.
-    
-    Returns:
-        dict: Dictionary containing all logger instances
-    """
-    # Initialize a dictionary to store all loggers
-    loggers = {
-        "main": create_logger("main", "main.log"),
-        "errors": create_logger("errors", "errors.log"),
-        "admin": create_logger("admin", "admin.log"),
-        "orders": create_logger("orders", "orders.log"),
-        "payments": create_logger("payments", "payments.log"),
-        "performance": create_logger("performance", "performance.log"),
-        "status": create_logger("status", "status.log"),
-        "users": create_logger("users", "users.log"),
-        "security": create_logger("security", "security.log")
-    }
-
-# Log startup message
+    # Log startup message
     loggers["main"].info("Bot logging system initialized")
     
     return loggers
@@ -611,9 +519,12 @@ class GoogleAPIsManager:
             return self._sheet_client
             
         try:
-            # Set up authentication for Google Sheets
+            # Set up authentication for Google Sheets using google-auth
             scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/drive']
-            creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+            creds = service_account.Credentials.from_service_account_file(
+                GOOGLE_CREDENTIALS_FILE,
+                scopes=scope
+            )
             self._sheet_client = gspread.authorize(creds)
             return self._sheet_client
         except Exception as e:
@@ -709,36 +620,7 @@ class GoogleAPIsManager:
             _, inventory_sheet = await self.initialize_sheets()
             
             if not inventory_sheet:
-                # Fallback to default inventory
-                self.loggers["errors"].warning("Using default inventory due to sheet access failure")
-                for item in DEFAULT_INVENTORY:
-                    product_name = item.get('Name', item.get('Strain', 'Unknown'))
-                    product_key = product_name.lower().replace(' ', '_')
-                    product_tag = item.get('Tag', '').lower()
-                    strain_type = item.get('Type', '').lower()
-                    price = item.get('Price', 0)
-                    stock = item.get('Stock', 0)
-                    
-                    product = {
-                        'name': product_name,
-                        'key': product_key,
-                        'price': price,
-                        'stock': stock,
-                        'tag': product_tag,
-                        'strain': strain_type,
-                        'weight': item.get('Weight', ''),
-                        'brand': item.get('Brand', '')
-                    }
-                    
-                    all_products.append(product)
-                    
-                    if product_tag and product_tag in products_by_tag:
-                        products_by_tag[product_tag].append(product)
-                        
-                    if strain_type and strain_type in products_by_strain:
-                        products_by_strain[strain_type].append(product)
-                
-                return products_by_tag, products_by_strain, all_products
+                return self._create_default_inventory()
             
             # Make a rate-limited request
             await self._rate_limit_request('inventory')
@@ -785,35 +667,43 @@ class GoogleAPIsManager:
         except Exception as e:
             self.loggers["errors"].error(f"Error fetching inventory: {e}")
             # Fallback to default inventory
-            self.loggers["errors"].warning("Using default inventory due to error")
-            for item in DEFAULT_INVENTORY:
-                product_name = item.get('Name', item.get('Strain', 'Unknown'))
-                product_key = product_name.lower().replace(' ', '_')
-                product_tag = item.get('Tag', '').lower()
-                strain_type = item.get('Type', '').lower()
-                price = item.get('Price', 0)
-                stock = item.get('Stock', 0)
-                
-                product = {
-                    'name': product_name,
-                    'key': product_key,
-                    'price': price,
-                    'stock': stock,
-                    'tag': product_tag,
-                    'strain': strain_type,
-                    'weight': item.get('Weight', ''),
-                    'brand': item.get('Brand', '')
-                }
-                
-                all_products.append(product)
-                
-                if product_tag and product_tag in products_by_tag:
-                    products_by_tag[product_tag].append(product)
-                    
-                if strain_type and strain_type in products_by_strain:
-                    products_by_strain[strain_type].append(product)
+            return self._create_default_inventory()
             
-            return products_by_tag, products_by_strain, all_products
+    def _create_default_inventory(self):
+        """Create a default inventory when API access fails."""
+        products_by_tag = {'buds': [], 'local': [], 'carts': [], 'edibs': []}
+        products_by_strain = {'indica': [], 'sativa': [], 'hybrid': []}
+        all_products = []
+        
+        for item in DEFAULT_INVENTORY:
+            product_name = item.get('Name', item.get('Strain', 'Unknown'))
+            product_key = product_name.lower().replace(' ', '_')
+            product_tag = item.get('Tag', '').lower()
+            strain_type = item.get('Type', '').lower()
+            price = item.get('Price', 0)
+            stock = item.get('Stock', 0)
+            
+            product = {
+                'name': product_name,
+                'key': product_key,
+                'price': price,
+                'stock': stock,
+                'tag': product_tag,
+                'strain': strain_type,
+                'weight': item.get('Weight', ''),
+                'brand': item.get('Brand', '')
+            }
+            
+            all_products.append(product)
+            
+            if product_tag and product_tag in products_by_tag:
+                products_by_tag[product_tag].append(product)
+                
+            if strain_type and strain_type in products_by_strain:
+                products_by_strain[strain_type].append(product)
+        
+        self.loggers["errors"].warning("Using default inventory due to API failure")
+        return products_by_tag, products_by_strain, all_products
     
     async def upload_payment_screenshot(self, file_bytes, filename):
         """
@@ -861,10 +751,14 @@ class GoogleAPIsManager:
                     if retry_count == max_retries:
                         raise
                     
-                    # Exponential backoff
-                    wait_time = 2 ** retry_count
+                    # Exponential backoff with jitter
+                    base_wait = 2 ** retry_count
+                    jitter = random.uniform(0, 0.5 * base_wait)
+                    wait_time = base_wait + jitter
+                    
                     self.loggers["errors"].warning(
-                        f"Drive upload failed, retrying in {wait_time} seconds: {e}"
+                        f"Drive upload attempt {retry_count}/{max_retries} failed: {e}. "
+                        f"Retrying in {wait_time:.2f} seconds"
                     )
                     await asyncio.sleep(wait_time)
             
@@ -975,6 +869,7 @@ class GoogleAPIsManager:
         Returns:
             dict: Order details or None if not found
         """
+
         try:
             # Initialize sheets
             sheet, _ = await self.initialize_sheets()
@@ -1008,22 +903,22 @@ class GoogleAPIsManager:
         Args:
             api_name (str): Name of the API being accessed
         """
-        # Ensure minimum time between requests to the same API
         now = time.time()
+        
+        # Check when this API was last accessed
         if api_name in self.last_request_time:
             elapsed = now - self.last_request_time[api_name]
             if elapsed < self.min_request_interval:
                 await asyncio.sleep(self.min_request_interval - elapsed)
-                
+        
         # Update the last request time
         self.last_request_time[api_name] = time.time()
 
 # ---------------------------- Utility Functions ----------------------------
 def is_valid_order_id(order_id):
     """Validate the format of an order ID."""
-    # Implement your validation logic here
-    # For example, checking if it's a valid pattern like "ORD-12345"
-    return bool(order_id and len(order_id) >= 3)  # Simple example
+    # Check for valid order ID pattern (WW-XXXX-YYY format)
+    return bool(order_id and re.match(r'^WW-\d{4}-[A-Z]{3}$', order_id))
 
 def get_user_orders(user_id):
     """Get a list of orders for a specific user."""
@@ -1399,16 +1294,27 @@ async def retry_operation(operation, max_retries=3):
         Exception: The last exception encountered after all retries
     """
     retry_count = 0
+    last_exception = None
+    
     while retry_count < max_retries:
         try:
             return await operation()
         except (ConnectionError, TimeoutError) as e:
+            last_exception = e
             retry_count += 1
             if retry_count == max_retries:
-                raise e
-            wait_time = 2 ** retry_count  # Exponential backoff
-            print(f"Operation failed, retrying in {wait_time} seconds...")
+                break
+                
+            # Exponential backoff with jitter
+            base_wait = 2 ** retry_count
+            jitter = random.uniform(0, 0.5 * base_wait)
+            wait_time = base_wait + jitter
+            
+            print(f"Operation failed, retrying in {wait_time:.2f} seconds...")
             await asyncio.sleep(wait_time)
+    
+    # If we get here, all retries failed
+    raise last_exception
 
 # ---------------------------- Inventory Management ----------------------------
 class InventoryManager:
@@ -1485,7 +1391,15 @@ class InventoryManager:
                 
             # Build fallback inventory
             self.loggers["main"].warning("Using fallback inventory")
-            return self._get_fallback_inventory()
+            products_by_tag, products_by_strain, all_products = self.google_apis._create_default_inventory()
+            
+            # Cache the fallback inventory
+            self.cache["products_by_tag"] = products_by_tag
+            self.cache["products_by_strain"] = products_by_strain
+            self.cache["all_products"] = all_products
+            self.cache["last_update"] = current_time
+            
+            return products_by_tag, products_by_strain, all_products
     
     async def category_has_products(self, category):
         """
@@ -1581,47 +1495,6 @@ class InventoryManager:
         unit_price = selected_product.get("price", 0)
         total_price = unit_price * quantity
         return total_price, unit_price
-    
-    def _get_fallback_inventory(self):
-        """
-        Generate fallback inventory data when API access fails.
-        
-        Returns:
-            tuple: (products_by_tag, products_by_strain, all_products)
-        """
-        products_by_tag = {'buds': [], 'local': [], 'carts': [], 'edibs': []}
-        products_by_strain = {'indica': [], 'sativa': [], 'hybrid': []}
-        all_products = []
-        
-        # Create fallback products from DEFAULT_INVENTORY
-        for item in DEFAULT_INVENTORY:
-            product_name = item.get('Name', item.get('Strain', 'Unknown'))
-            product_key = product_name.lower().replace(' ', '_')
-            product_tag = item.get('Tag', '').lower()
-            strain_type = item.get('Type', '').lower()
-            price = item.get('Price', 0)
-            stock = item.get('Stock', 0)
-            
-            product = {
-                'name': product_name,
-                'key': product_key,
-                'price': price,
-                'stock': stock,
-                'tag': product_tag,
-                'strain': strain_type,
-                'weight': item.get('Weight', ''),
-                'brand': item.get('Brand', '')
-            }
-            
-            all_products.append(product)
-            
-            if product_tag and product_tag in products_by_tag:
-                products_by_tag[product_tag].append(product)
-                
-            if strain_type and strain_type in products_by_strain:
-                products_by_strain[strain_type].append(product)
-        
-        return products_by_tag, products_by_strain, all_products
 
 # ---------------------------- Order Management ----------------------------
 class OrderManager:
@@ -1822,7 +1695,7 @@ class OrderManager:
         tracking_link = order_details.get(SHEET_COLUMNS["tracking_link"], "")
         
         return status, tracking_link, order_details
-
+    
 # ---------------------------- Order Handlers ----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
@@ -2097,6 +1970,7 @@ async def back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
     
     return CATEGORY
+
 async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle strain type selection for products that require it.
@@ -2901,7 +2775,7 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
     elif query.data == 'edit_details':
         await query.edit_message_text(MESSAGES["checkout_prompt"])
         return DETAILS
-    
+
 # ---------------------------- Payment & Tracking Handlers ----------------------------
 async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Wrapper for the track_order function that handles the initial /track command."""
@@ -3155,146 +3029,169 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return TRACK_ORDER
     
-    # Initialize sheets
-    sheet, _ = await google_apis.initialize_sheets()
-    if not sheet:
-        await update.message.reply_text(
-            ERRORS["sheet_init_failed"],
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-            ])
-        )
-        return ConversationHandler.END
-    
-    # Get orders
-    orders = sheet.get_all_records()
-    
-    # Find the order
-    found_order = None
-    for order in orders:
-        if order.get('Order ID') == order_id and order.get('Product') == "COMPLETE ORDER":
-            found_order = order
-            break
-    
-    if not found_order:
-        await update.message.reply_text(
-            MESSAGES["order_not_found"].format(order_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-            ])
-        )
-        context.user_data.pop('track_order_id', None)
-        return ConversationHandler.END
-    
-    # Get order details
-    status = found_order.get('Status', 'Pending')
-    order_date = found_order.get('Order Date', 'Unknown')
-    notes = found_order.get('Notes', '')
-    price = found_order.get('Price', '₱0')
-    tracking_link = found_order.get('Tracking Link', '')
-    
-    # Parse the notes field to extract items
-    items_text = ""
-    if notes:
-        # Split notes by line
-        items_list = [line.strip() for line in notes.split('\n') if line.strip()]
+    try:
+        # Initialize sheets
+        sheet, _ = await google_apis.initialize_sheets()
+        if not sheet:
+            await update.message.reply_text(
+                ERRORS["sheet_init_failed"],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+                ])
+            )
+            return ConversationHandler.END
         
-        # Format each item line
-        for item in items_list:
-            # Remove any leading bullets or markers
-            clean_item = item.lstrip('•').strip()
+        # Get orders
+        orders = sheet.get_all_records()
+        
+        # Find the order
+        found_order = None
+        for order in orders:
+            if order.get('Order ID') == order_id and order.get('Product') == "COMPLETE ORDER":
+                found_order = order
+                break
+        
+        if not found_order:
+            await update.message.reply_text(
+                MESSAGES["order_not_found"].format(order_id),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+                ])
+            )
+            context.user_data.pop('track_order_id', None)
+            return ConversationHandler.END
+        
+        # Get order details
+        status = found_order.get('Status', 'Pending')
+        order_date = found_order.get('Order Date', 'Unknown')
+        notes = found_order.get('Notes', '')
+        price = found_order.get('Price', '₱0')
+        tracking_link = found_order.get('Tracking Link', '')
+        
+        # Parse the notes field to extract items
+        items_text = ""
+        if notes:
+            # Split notes by line
+            items_list = [line.strip() for line in notes.split('\n') if line.strip()]
             
-            # Check if this is an actual item line
-            if 'x ' in clean_item and ':' in clean_item:
-                try:
-                    # Extract quantity, product, and price
-                    quantity_part, rest = clean_item.split('x ', 1)
-                    product_info, price_part = rest.split(':', 1)
-                    
-                    # Clean up any extra spaces
-                    quantity = quantity_part.strip()
-                    product = product_info.strip()
-                    
-                    # Format price more cleanly
-                    price_match = re.search(r'(₱[\d,]+\.\d{2})', price_part)
-                    price_str = price_match.group(1) if price_match else price_part.strip()
-                    
-                    # Check for strain in parentheses
-                    if "(" in product and ")" in product:
-                        product_name, strain_info = product.split("(", 1)
-                        strain_info = strain_info.rstrip(")")
-                        # Format as Product - Strain
-                        items_text += f"• {quantity}x {product_name.strip()} - {strain_info} - {price_str}\n"
-                    else:
-                        items_text += f"• {quantity}x {product} - {price_str}\n"
-                except Exception as e:
-                    # If parsing fails, just use the original line
+            # Format each item line
+            for item in items_list:
+                # Remove any leading bullets or markers
+                clean_item = item.lstrip('•').strip()
+                
+                # Check if this is an actual item line
+                if 'x ' in clean_item and ':' in clean_item:
+                    try:
+                        # Extract quantity, product, and price
+                        quantity_part, rest = clean_item.split('x ', 1)
+                        product_info, price_part = rest.split(':', 1)
+                        
+                        # Clean up any extra spaces
+                        quantity = quantity_part.strip()
+                        product = product_info.strip()
+                        
+                        # Format price more cleanly
+                        price_match = re.search(r'(₱[\d,]+\.\d{2})', price_part)
+                        price_str = price_match.group(1) if price_match else price_part.strip()
+                        
+                        # Check for strain in parentheses
+                        if "(" in product and ")" in product:
+                            product_name, strain_info = product.split("(", 1)
+                            strain_info = strain_info.rstrip(")")
+                            # Format as Product - Strain
+                            items_text += f"• {quantity}x {product_name.strip()} - {strain_info} - {price_str}\n"
+                        else:
+                            items_text += f"• {quantity}x {product} - {price_str}\n"
+                    except Exception as e:
+                        # If parsing fails, just use the original line
+                        items_text += f"• {clean_item}\n"
+                        loggers["errors"].warning(f"Error parsing item line: {e}")
+                else:
+                    # Not a standard item line, include as is
                     items_text += f"• {clean_item}\n"
-                    loggers["errors"].warning(f"Error parsing item line: {e}")
-            else:
-                # Not a standard item line, include as is
-                items_text += f"• {clean_item}\n"
-    
-    if not items_text:
-        items_text = "• No detailed items found"
-    
-    # Create the tracking message
-    message = (
-        f"{EMOJI['package']} <b>Order Status Update</b>\n\n"
-        f"{EMOJI['id']} Order ID: {order_id}\n"
-        f"{EMOJI['date']} Ordered on: {order_date}\n"
-        f"{EMOJI['status']} Status: {status}\n"
-        f"{EMOJI['cart']} Items:\n{items_text}\n"
-        f"{EMOJI['money']} Total: {price}\n"
-    )
-    
-    # Add tracking link if available
-    if tracking_link:
-        message += f"\n{EMOJI['link']} <b>Track your delivery:</b> {tracking_link}\n"
-    
-    # Add contextual hints based on status
-    status_lower = status.lower()
-    if "pending" in status_lower or "processing" in status_lower:
-        message += (
-            f"\n{EMOJI['info']} Your order is being processed. "
-            f"We'll update you when it ships!"
+        
+        if not items_text:
+            items_text = "• No detailed items found"
+        
+        # Create the tracking message
+        message = (
+            f"{EMOJI['package']} <b>Order Status Update</b>\n\n"
+            f"{EMOJI['id']} Order ID: {order_id}\n"
+            f"{EMOJI['date']} Ordered on: {order_date}\n"
+            f"{EMOJI['status']} Status: {status}\n"
+            f"{EMOJI['cart']} Items:\n{items_text}\n"
+            f"{EMOJI['money']} Total: {price}\n"
         )
-    elif "payment" in status_lower and "rejected" in status_lower:
-        message += (
-            f"\n{EMOJI['warning']} Your payment was rejected. "
-            f"Please contact support for assistance."
+        
+        # Add tracking link if available
+        if tracking_link:
+            message += f"\n{EMOJI['link']} <b>Track your delivery:</b> {tracking_link}\n"
+        
+        # Add contextual hints based on status
+        status_lower = status.lower()
+        if "pending" in status_lower or "processing" in status_lower:
+            message += (
+                f"\n{EMOJI['info']} Your order is being processed. "
+                f"We'll update you when it ships!"
+            )
+        elif "payment" in status_lower and "rejected" in status_lower:
+            message += (
+                f"\n{EMOJI['warning']} Your payment was rejected. "
+                f"Please contact support for assistance."
+            )
+        elif "payment" in status_lower and "pending" in status_lower:
+            message += (
+                f"\n{EMOJI['info']} We're waiting for your payment confirmation. "
+                f"Please complete payment to proceed."
+            )
+        elif "shipped" in status_lower or "transit" in status_lower:
+            message += (
+                f"\n{EMOJI['truck']} Your order is on its way! "
+                f"Use the tracking link above to follow your delivery."
+            )
+        elif "delivered" in status_lower or "completed" in status_lower:
+            message += (
+                f"\n{EMOJI['party']} Your order has been delivered! "
+                f"Thank you for shopping with us."
+            )
+        
+        # Create the keyboard buttons
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh Status", callback_data=f"refresh_tracking_{order_id}")],
+            [InlineKeyboardButton(f"{EMOJI['support']} Need Help?", callback_data="contact_support")],
+            [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+        ]
+        
+        # Use a try-except block for sending the message to handle potential errors
+        try:
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True
+            )
+        except TelegramError as e:
+            loggers["errors"].error(f"Failed to send tracking info to user {update.effective_user.id}: {e}")
+            # Send a simpler fallback message
+            try:
+                await update.message.reply_text(
+                    f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
+                )
+            except:
+                pass  # Last resort - at least we logged the error
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        loggers["errors"].error(f"Error in track_order: {e}")
+        await update.message.reply_text(
+            f"{EMOJI['error']} An error occurred while tracking your order. Please try again later.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
         )
-    elif "payment" in status_lower and "pending" in status_lower:
-        message += (
-            f"\n{EMOJI['info']} We're waiting for your payment confirmation. "
-            f"Please complete payment to proceed."
-        )
-    elif "shipped" in status_lower or "transit" in status_lower:
-        message += (
-            f"\n{EMOJI['truck']} Your order is on its way! "
-            f"Use the tracking link above to follow your delivery."
-        )
-    elif "delivered" in status_lower or "completed" in status_lower:
-        message += (
-            f"\n{EMOJI['party']} Your order has been delivered! "
-            f"Thank you for shopping with us."
-        )
-    
-    # Create the keyboard buttons
-    keyboard = [
-        [InlineKeyboardButton("🔄 Refresh Status", callback_data=f"refresh_tracking_{order_id}")],
-        [InlineKeyboardButton(f"{EMOJI['support']} Need Help?", callback_data="contact_support")],
-        [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-    ]
-    
-    await update.message.reply_text(
-        message,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True
-    )
-    
-    return ConversationHandler.END
+        return ConversationHandler.END
 
 async def get_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the order ID input from the user."""
@@ -3317,21 +3214,8 @@ async def get_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Log the tracking request
     logging.info(f"User {user_id} tracking order {order_id}")
     
-    # Get order details
-    order_details = get_order_details(order_id)
-    if not order_details:
-        await update.message.reply_text(
-            f"{EMOJI['error']} <b>Order Not Found</b>\n\n"
-            f"We couldn't find any order with ID: {order_id}\n"
-            f"Please check the order ID and try again.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Try Again", callback_data="enter_order_id")
-            ]])
-        )
-        return TRACK_ORDER
-    
-    # Process the tracked order
+    # Process the tracked order immediately
+    # No need to get order details here as track_order will handle that
     return await track_order(update, context)
 
 async def refresh_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3413,945 +3297,462 @@ async def handle_order_tracking(
     # Log the successful tracking
     loggers["main"].info(f"User {user.id} tracked order {order_id}")
     
-    await update.message.reply_text(response_text)
+    try:
+        await update.message.reply_text(response_text)
+    except TelegramError as e:
+        loggers["errors"].error(f"Failed to send tracking response: {e}")
+        # Send simplified message as fallback
+        await update.message.reply_text(
+            f"Order {order_id} status: {status}. Use the /track command again if you need more details."
+        )
+    
     return ConversationHandler.END
 
-# ---------------------------- Admin Handlers ----------------------------
-async def admin_panel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    admin_id, loggers
-):
-    """
-    Admin panel entry point - checks authorization and displays admin options.
+# ---------------------------- Admin Panel ----------------------------
+class AdminPanel:
+    """Handles all admin panel functionality."""
     
-    Args:
-        update: Telegram update
-        context: Conversation context
-        admin_id: Telegram ID of the admin
-        loggers: Dictionary of logger instances
+    def __init__(self, bot, admin_id, google_apis, order_manager, loggers):
+        """
+        Initialize the Admin Panel.
         
-    Returns:
-        None
-    """
-    user = update.message.from_user
-    
-    # Check if user is authorized
-    if user.id != admin_id:
-        await update.message.reply_text(MESSAGES["not_authorized"])
-        loggers["admin"].warning(f"Unauthorized admin panel access attempt by user {user.id}")
-        return
-    
-    # Check rate limits
-    if not check_rate_limit(context, user.id, "admin"):
+        Args:
+            bot: The Telegram bot instance
+            admin_id: Telegram ID of the admin user
+            google_apis: GoogleAPIsManager instance
+            order_manager: OrderManager instance
+            loggers: Dictionary of logger instances
+        """
+        self.bot = bot
+        self.admin_id = admin_id
+        self.google_apis = google_apis
+        self.order_manager = order_manager
+        self.loggers = loggers
+        
+    async def show_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display the admin panel main menu."""
+        user = update.message.from_user
+        
+        # Check if user is authorized
+        if user.id != self.admin_id:
+            await update.message.reply_text(MESSAGES["not_authorized"])
+            self.loggers["admin"].warning(f"Unauthorized admin panel access attempt by user {user.id}")
+            return
+        
+        # Check rate limits
+        if not check_rate_limit(context, user.id, "admin"):
+            await update.message.reply_text(
+                f"{EMOJI['warning']} You've reached the maximum number of admin actions allowed per hour. "
+                "Please try again later."
+            )
+            return
+        
+        # Log the admin panel access
+        self.loggers["admin"].info(f"Admin {user.id} accessed admin panel")
+        
+        # Send welcome message with options
         await update.message.reply_text(
-            f"{EMOJI['warning']} You've reached the maximum number of admin actions allowed per hour. "
-            "Please try again later."
+            MESSAGES["admin_welcome"],
+            reply_markup=self._build_admin_buttons()
         )
-        return
     
-    # Log the admin panel access
-    loggers["admin"].info(f"Admin {user.id} accessed admin panel")
-    
-    # Send welcome message with options
-    await update.message.reply_text(
-        MESSAGES["admin_welcome"],
-        reply_markup=build_admin_buttons()
-    )
-
-async def view_orders(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    google_apis, loggers
-):
-    """
-    Display all orders with filtering options.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Get filter from context or set default
-    status_filter = context.user_data.get('status_filter', 'all')
-    
-    # Initialize sheets
-    sheet, _ = await google_apis.initialize_sheets()
-    if not sheet:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Failed to access order data. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Get orders
-    orders = sheet.get_all_records()
-    
-    # Filter for main order entries only (COMPLETE ORDER)
-    main_orders = []
-    for order in orders:
-        if 'Product' in order and order['Product'] == "COMPLETE ORDER":
-            main_orders.append(order)
-    
-    # Apply status filter if not 'all'
-    if status_filter != 'all':
-        filtered_orders = []
-        for order in main_orders:
-            if 'Status' in order and order['Status'].lower() == status_filter.lower():
-                filtered_orders.append(order)
-        main_orders = filtered_orders
-    
-    # Sort orders by date (newest first) if date field exists
-    if main_orders and 'Order Date' in main_orders[0]:
-        main_orders.sort(key=lambda x: x.get('Order Date', ''), reverse=True)
-    
-    # Check if we have orders to display
-    if not main_orders:
-        # Create filter buttons
-        filter_buttons = build_filter_buttons(status_filter)
-        keyboard = filter_buttons + [
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-        ]
-        
-        await query.edit_message_text(
-            f"No orders found with status filter: {status_filter}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    # Create the orders message (showing up to 5 orders)
-    message = f"{EMOJI['list']} Orders (Filter: {status_filter.upper()}):\n\n"
-    
-    display_orders = main_orders[:5]  # Limit to 5 orders to avoid message size limits
-    
-    # Create order buttons
-    order_buttons = []
-    for order in display_orders:
-        order_id = order.get('Order ID', 'Unknown')
-        customer = order.get('Customer Name', order.get('Name', 'Unknown Customer'))
-        status = order.get('Status', 'Unknown')
-        date = order.get('Order Date', 'N/A')
-        total = order.get('Price', order.get('Total Price', '₱0'))
-        
-        # Add order summary to message
-        message += (
-            f"{EMOJI['id']} {order_id}\n"
-            f"{EMOJI['customer']} {customer}\n"
-            f"{EMOJI['money']} {total}\n"
-            f"{EMOJI['date']} {date}\n"
-            f"{EMOJI['status']} Status: {status}\n"
-            f"------------------------\n"
-        )
-        
-        # Add button for this order
-        order_buttons.append([
-            InlineKeyboardButton(
-                f"Manage: {order_id}", 
-                callback_data=f'manage_order_{order_id}'
-            )
-        ])
-    
-    # Create navigation buttons if there are more orders
-    nav_buttons = []
-    if len(main_orders) > 5:
-        nav_buttons = [[
-            InlineKeyboardButton("◀️ Previous", callback_data="prev_orders"),
-            InlineKeyboardButton("Next ▶️", callback_data="next_orders")
-        ]]
-    
-    # Create filter buttons
-    filter_buttons = build_filter_buttons(status_filter)
-    
-    # Combine all buttons
-    keyboard = (
-        order_buttons + 
-        nav_buttons + 
-        filter_buttons + 
-        [[InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]]
-    )
-    
-    loggers["admin"].info(f"Admin viewed orders with filter: {status_filter}")
-    
-    await query.edit_message_text(
-        message, 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def review_payments(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers):
-    """
-    Display a list of orders with pending payment status for review.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Log the action
-    user = query.from_user
-    loggers["admin"].info(f"Admin {user.id} accessed payment review")
-    
-    # Initialize sheets
-    sheet, _ = await google_apis.initialize_sheets()
-    if not sheet:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Failed to access order data. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Get orders
-    orders = sheet.get_all_records()
-    
-    # Filter for orders with pending payment status
-    pending_payments = []
-    for order in orders:
-        if (order.get('Product') == "COMPLETE ORDER" and 
-            order.get('Status', '').lower() == "pending payment review"):
-            pending_payments.append(order)
-    
-    # Check if we have any pending payments
-    if not pending_payments:
-        await query.edit_message_text(
-            f"{EMOJI['info']} No orders pending payment review at this time.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Sort by date (newest first)
-    pending_payments.sort(key=lambda x: x.get('Order Date', ''), reverse=True)
-    
-    # Create a message with pending payment orders (show up to 5)
-    message = f"{EMOJI['payment']} Orders Pending Payment Review:\n\n"
-    
-    display_orders = pending_payments[:5]
-    
-    # Create order buttons
-    payment_buttons = []
-    for order in display_orders:
-        order_id = order.get('Order ID', 'Unknown')
-        customer = order.get('Customer Name', order.get('Name', 'Unknown Customer'))
-        date = order.get('Order Date', 'N/A')
-        total = order.get('Price', order.get('Total Price', '₱0'))
-        
-        # Add order summary to message
-        message += (
-            f"{EMOJI['id']} {order_id}\n"
-            f"{EMOJI['customer']} {customer}\n"
-            f"{EMOJI['money']} {total}\n"
-            f"{EMOJI['date']} {date}\n"
-            f"------------------------\n"
-        )
-        
-        # Add button for this order
-        payment_buttons.append([
-            InlineKeyboardButton(
-                f"Review: {order_id}", 
-                callback_data=f'review_payment_{order_id}'
-            )
-        ])
-    
-    # Create navigation buttons if there are more orders
-    nav_buttons = []
-    if len(pending_payments) > 5:
-        nav_buttons = [[
-            InlineKeyboardButton("◀️ Previous", callback_data="prev_payments"),
-            InlineKeyboardButton("Next ▶️", callback_data="next_payments")
-        ]]
-    
-    # Combine all buttons
-    keyboard = (
-        payment_buttons + 
-        nav_buttons + 
-        [[InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]]
-    )
-    
-    await query.edit_message_text(
-        message, 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def review_specific_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers, order_manager):
-    """
-    Review a specific payment and provide options to approve or reject.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
-        order_manager: OrderManager instance
-        
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Extract order ID from callback data
-    order_id = query.data.replace('review_payment_', '')
-    
-    # Store order ID in context
-    context.user_data['current_order_id'] = order_id
-    
-    # Get order details
-    order_details = await order_manager.get_order_details(order_id)
-    
-    if not order_details:
-        await query.edit_message_text(
-            MESSAGES["order_not_found"].format(order_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Payment Review", callback_data='approve_payments')]
-            ])
-        )
-        return
-    
-    # Extract order information
-    customer = order_details.get('Customer Name', order_details.get('Name', 'Unknown'))
-    address = order_details.get('Address', 'No address provided')
-    contact = order_details.get('Contact', order_details.get('Phone', 'No contact provided'))
-    status = order_details.get('Status', 'Unknown')
-    date = order_details.get('Order Date', 'N/A')
-    total = order_details.get('Price', order_details.get('Total Price', '₱0'))
-    payment_url = order_details.get('Payment URL', 'N/A')
-    
-    # Build message
-    message = (
-        f"{EMOJI['payment']} Payment Review: {order_id}\n\n"
-        f"{EMOJI['customer']} Customer: {customer}\n"
-        f"{EMOJI['phone']} Contact: {contact}\n"
-        f"{EMOJI['address']} Address: {address}\n"
-        f"{EMOJI['date']} Date: {date}\n"
-        f"{EMOJI['status']} Status: {status}\n"
-        f"{EMOJI['money']} Total: {total}\n\n"
-        f"{EMOJI['screenshot']} Payment Screenshot: {payment_url}\n\n"
-        f"{EMOJI['cart']} Items:\n{order_details.get('Notes', '• No detailed items found')}\n\n"
-        f"Please verify the payment screenshot and select an action below:"
-    )
-    
-    # Create action buttons
-    keyboard = [
-        [InlineKeyboardButton(f"{EMOJI['success']} Approve Payment", callback_data=f'approve_payment_{order_id}')],
-        [InlineKeyboardButton(f"{EMOJI['error']} Reject Payment", callback_data=f'reject_payment_{order_id}')],
-        [InlineKeyboardButton(f"{EMOJI['back']} Back to Payment Review", callback_data='approve_payments')]
-    ]
-    
-    # Log the action
-    loggers["admin"].info(f"Admin reviewing payment for order {order_id}")
-    
-    await query.edit_message_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True
-    )
-
-async def process_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE, order_manager, loggers):
-    """
-    Process payment approval or rejection.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        order_manager: OrderManager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Determine action type and order ID
-    action_data = query.data
-    order_id = context.user_data.get('current_order_id')
-    
-    if not order_id:
-        # Extract from callback data as fallback
-        if action_data.startswith('approve_payment_'):
-            order_id = action_data.replace('approve_payment_', '')
-        elif action_data.startswith('reject_payment_'):
-            order_id = action_data.replace('reject_payment_', '')
-    
-    if not order_id:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Error: Order ID not found.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Set new status based on action
-    if action_data.startswith('approve_payment_'):
-        new_status = STATUS["payment_confirmed"]["label"]
-        action_type = "approved"
-    elif action_data.startswith('reject_payment_'):
-        new_status = STATUS["payment_rejected"]["label"]
-        action_type = "rejected"
-    else:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Invalid action selected.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Update order status
-    success = await order_manager.update_order_status(context, order_id, new_status)
-    
-    if success:
-        # Log the action
-        loggers["admin"].info(f"Admin {action_type} payment for order {order_id}")
-        
+    def _build_admin_buttons(self):
+        """Create the admin panel main menu buttons."""
         keyboard = [
-            [InlineKeyboardButton("Back to Payment Review", callback_data='approve_payments')],
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            [InlineKeyboardButton(f"{EMOJI['list']} View All Orders", callback_data='view_orders')],
+            [InlineKeyboardButton(f"{EMOJI['search']} Search Order by ID", callback_data='search_order')],
+            [InlineKeyboardButton(f"{EMOJI['inventory']} Manage Inventory", callback_data='manage_inventory')],
+            [InlineKeyboardButton(f"{EMOJI['review']} Review Payments", callback_data='approve_payments')]
         ]
         
+        return InlineKeyboardMarkup(keyboard)
+        
+    async def view_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Display all orders with filtering options.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Get filter from context or set default
+        status_filter = context.user_data.get('status_filter', 'all')
+        
+        # Initialize sheets
+        sheet, _ = await self.google_apis.initialize_sheets()
+        if not sheet:
+            await query.edit_message_text(
+                f"{EMOJI['error']} Failed to access order data. Please try again later.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                ])
+            )
+            return
+        
+        # Get orders
+        orders = sheet.get_all_records()
+        
+        # Filter for main order entries only (COMPLETE ORDER)
+        main_orders = []
+        for order in orders:
+            if 'Product' in order and order['Product'] == "COMPLETE ORDER":
+                main_orders.append(order)
+        
+        # Apply status filter if not 'all'
+        if status_filter != 'all':
+            filtered_orders = []
+            for order in main_orders:
+                if 'Status' in order and order['Status'].lower() == status_filter.lower():
+                    filtered_orders.append(order)
+            main_orders = filtered_orders
+        
+        # Sort orders by date (newest first) if date field exists
+        if main_orders and 'Order Date' in main_orders[0]:
+            main_orders.sort(key=lambda x: x.get('Order Date', ''), reverse=True)
+        
+        # Check if we have orders to display
+        if not main_orders:
+            # Create filter buttons
+            filter_buttons = self._build_filter_buttons(status_filter)
+            keyboard = filter_buttons + [
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ]
+            
+            await query.edit_message_text(
+                f"No orders found with status filter: {status_filter}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        # Create the orders message (showing up to 5 orders)
+        message = f"{EMOJI['list']} Orders (Filter: {status_filter.upper()}):\n\n"
+        
+        display_orders = main_orders[:5]  # Limit to 5 orders to avoid message size limits
+        
+        # Create order buttons
+        order_buttons = []
+        for order in display_orders:
+            order_id = order.get('Order ID', 'Unknown')
+            customer = order.get('Customer Name', order.get('Name', 'Unknown Customer'))
+            status = order.get('Status', 'Unknown')
+            date = order.get('Order Date', 'N/A')
+            total = order.get('Price', order.get('Total Price', '₱0'))
+            
+            # Add order summary to message
+            message += (
+                f"{EMOJI['id']} {order_id}\n"
+                f"{EMOJI['customer']} {customer}\n"
+                f"{EMOJI['money']} {total}\n"
+                f"{EMOJI['date']} {date}\n"
+                f"{EMOJI['status']} Status: {status}\n"
+                f"------------------------\n"
+            )
+            
+            # Add button for this order
+            order_buttons.append([
+                InlineKeyboardButton(
+                    f"Manage: {order_id}", 
+                    callback_data=f'manage_order_{order_id}'
+                )
+            ])
+        
+        # Create navigation buttons if there are more orders
+        nav_buttons = []
+        if len(main_orders) > 5:
+            nav_buttons = [[
+                InlineKeyboardButton("◀️ Previous", callback_data="prev_orders"),
+                InlineKeyboardButton("Next ▶️", callback_data="next_orders")
+            ]]
+        
+        # Create filter buttons
+        filter_buttons = self._build_filter_buttons(status_filter)
+        
+        # Combine all buttons
+        keyboard = (
+            order_buttons + 
+            nav_buttons + 
+            filter_buttons + 
+            [[InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]]
+        )
+        
+        self.loggers["admin"].info(f"Admin viewed orders with filter: {status_filter}")
+        
         await query.edit_message_text(
-            f"{EMOJI['success']} Payment for Order {order_id} has been {action_type}.\n\n"
-            f"Status updated to: {new_status}",
+            message, 
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    else:
-        await query.edit_message_text(
-            ERRORS["update_failed"].format(order_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-
-def build_filter_buttons(current_filter):
-    """
-    Helper function to build status filter buttons.
-    
-    Args:
-        current_filter: Current selected filter
         
-    Returns:
-        list: Rows of filter buttons
-    """
-    filters = [
-        ("All", "filter_all"),
-        ("Pending Payment", "filter_pending_payment_review"),
-        ("Payment Confirmed", "filter_payment_confirmed_and_preparing_order"),
-        ("Booking", "filter_booking"),
-        ("Booked", "filter_booked"),
-        ("Delivered", "filter_delivered")
-    ]
-    
-    # Create filter buttons (maximum 3 per row)
-    filter_buttons = []
-    current_row = []
-    
-    for label, callback_data in filters:
-        # Mark the current filter
-        if (current_filter == 'all' and callback_data == 'filter_all') or \
-           (callback_data[7:] == current_filter):
-            label = f"✓ {label}"
+    def _build_filter_buttons(self, current_filter):
+        """
+        Helper function to build status filter buttons.
         
-        current_row.append(InlineKeyboardButton(label, callback_data=callback_data))
+        Args:
+            current_filter: Current selected filter
+            
+        Returns:
+            list: Rows of filter buttons
+        """
+        filters = [
+            ("All", "filter_all"),
+            ("Pending Payment", "filter_pending_payment_review"),
+            ("Payment Confirmed", "filter_payment_confirmed_and_preparing_order"),
+            ("Booking", "filter_booking"),
+            ("Booked", "filter_booked"),
+            ("Delivered", "filter_delivered")
+        ]
         
-        # Start a new row after 3 buttons
-        if len(current_row) == 3:
+        # Create filter buttons (maximum 3 per row)
+        filter_buttons = []
+        current_row = []
+        
+        for label, callback_data in filters:
+            # Mark the current filter
+            if (current_filter == 'all' and callback_data == 'filter_all') or \
+               (callback_data[7:] == current_filter):
+                label = f"✓ {label}"
+            
+            current_row.append(InlineKeyboardButton(label, callback_data=callback_data))
+            
+            # Start a new row after 3 buttons
+            if len(current_row) == 3:
+                filter_buttons.append(current_row)
+                current_row = []
+        
+        # Add any remaining buttons
+        if current_row:
             filter_buttons.append(current_row)
-            current_row = []
-    
-    # Add any remaining buttons
-    if current_row:
-        filter_buttons.append(current_row)
-    
-    return filter_buttons
-
-async def filter_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers):
-    """
-    Handle order filtering by status.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
         
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
+        return filter_buttons
     
-    # Extract the filter from callback data
-    filter_value = query.data.replace('filter_', '')
-    
-    # Store the filter in context
-    context.user_data['status_filter'] = filter_value
-    
-    loggers["admin"].info(f"Admin set order filter to: {filter_value}")
-    
-    # Refresh the orders view
-    await view_orders(update, context, google_apis, loggers)
-
-async def manage_order(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    google_apis, loggers
-):
-    """
-    Show order details and management options.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
+    async def manage_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id=None):
+        """
+        Show order details and management options.
         
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Extract order ID from callback data
-    order_id = query.data.replace('manage_order_', '')
-    
-    # Store order ID in context
-    context.user_data['current_order_id'] = order_id
-    
-    # Initialize sheets
-    sheet, _ = await google_apis.initialize_sheets()
-    if not sheet:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Failed to access order data. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Get orders
-    orders = sheet.get_all_records()
-    
-    # Find main order
-    main_order = None
-    order_items = []
-    
-    for order in orders:
-        if 'Order ID' in order and order['Order ID'] == order_id:
-            if 'Product' in order and order['Product'] == "COMPLETE ORDER":
-                main_order = order
-            else:
-                order_items.append(order)
-    
-    if not main_order:
-        await query.edit_message_text(
-            MESSAGES["order_not_found"].format(order_id),
-            reply_markup=InlineKeyboardMarkup([
+        Args:
+            update: Telegram update
+            context: Conversation context
+            order_id: Optional order ID if not from callback query
+        """
+        # Determine if this was called from a callback query
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            
+            # Extract order ID from callback data if not provided
+            if not order_id:
+                order_id = query.data.replace('manage_order_', '')
+            
+            # Store order ID in context
+            context.user_data['current_order_id'] = order_id
+        
+        # Get the order details
+        order_details = await self.order_manager.get_order_details(order_id)
+        
+        if not order_details:
+            # Prepare error message
+            error_message = MESSAGES["order_not_found"].format(order_id)
+            back_button = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
             ])
-        )
-        return
-    
-    # Create detailed order message with safe gets
-    customer = main_order.get('Customer Name', main_order.get('Name', 'Unknown'))
-    address = main_order.get('Address', 'No address provided')
-    contact = main_order.get('Contact', main_order.get('Phone', 'No contact provided'))
-    status = main_order.get('Status', 'Unknown')
-    date = main_order.get('Order Date', 'N/A')
-    total = main_order.get('Price', main_order.get('Total Price', '₱0'))
-    payment_url = main_order.get('Payment URL', 'N/A')
-    tracking_link = main_order.get('Tracking Link', '')
-    
-    message = (
-        f"{EMOJI['search']} Order Details: {order_id}\n\n"
-        f"{EMOJI['customer']} Customer: {customer}\n"
-        f"{EMOJI['phone']} Contact: {contact}\n"
-        f"{EMOJI['address']} Address: {address}\n"
-        f"{EMOJI['date']} Date: {date}\n"
-        f"{EMOJI['status']} Status: {status}\n"
-        f"{EMOJI['money']} Total: {total}\n\n"
-    )
-    
-    # Add tracking link if available
-    if tracking_link:
-        message += f"{EMOJI['link']} Tracking: {tracking_link}\n\n"
-    
-    # Add order items from Notes field
-    message += f"{EMOJI['cart']} Items:\n{main_order.get('Notes', '• No detailed items found')}\n"
-    
-    # Create management buttons
-    keyboard = [
-        [InlineKeyboardButton(f"{EMOJI['update']} Update Status", callback_data=f'update_status_{order_id}')],
-        [InlineKeyboardButton(f"{EMOJI['link']} Add/Update Tracking", callback_data=f'add_tracking_{order_id}')],
-        [InlineKeyboardButton(f"{EMOJI['screenshot']} View Payment Screenshot", callback_data=f'view_payment_{order_id}')]
-    ]
-    
-    # Add back button
-    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')])
-    
-    loggers["admin"].info(f"Admin viewing order details for {order_id}")
-    
-    await query.edit_message_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True  # Prevent tracking links from generating previews
-    )
-
-async def view_payment_screenshot(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    google_apis, loggers
-):
-    """
-    Send the payment screenshot to the admin.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
+            
+            # Send or edit the message based on update type
+            if update.callback_query:
+                await update.callback_query.edit_message_text(error_message, reply_markup=back_button)
+            else:
+                await update.message.reply_text(error_message, reply_markup=back_button)
+            return
         
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Get order ID from context or callback data
-    order_id = context.user_data.get('current_order_id')
-    if not order_id:
-        order_id = query.data.replace('view_payment_', '')
-    
-    # Initialize sheets
-    sheet, _ = await google_apis.initialize_sheets()
-    if not sheet:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Failed to access order data. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
+        # Create detailed order message with safe gets
+        customer = order_details.get('Customer Name', order_details.get('Name', 'Unknown'))
+        address = order_details.get('Address', 'No address provided')
+        contact = order_details.get('Contact', order_details.get('Phone', 'No contact provided'))
+        status = order_details.get('Status', 'Unknown')
+        date = order_details.get('Order Date', 'N/A')
+        total = order_details.get('Price', order_details.get('Total Price', '₱0'))
+        payment_url = order_details.get('Payment URL', 'N/A')
+        tracking_link = order_details.get('Tracking Link', '')
+        
+        message = (
+            f"{EMOJI['search']} Order Details: {order_id}\n\n"
+            f"{EMOJI['customer']} Customer: {customer}\n"
+            f"{EMOJI['phone']} Contact: {contact}\n"
+            f"{EMOJI['address']} Address: {address}\n"
+            f"{EMOJI['date']} Date: {date}\n"
+            f"{EMOJI['status']} Status: {status}\n"
+            f"{EMOJI['money']} Total: {total}\n\n"
         )
-        return
+        
+        # Add tracking link if available
+        if tracking_link:
+            message += f"{EMOJI['link']} Tracking: {tracking_link}\n\n"
+        
+        # Add order items from Notes field
+        message += f"{EMOJI['cart']} Items:\n{order_details.get('Notes', '• No detailed items found')}\n"
+        
+        # Create management buttons
+        keyboard = [
+            [InlineKeyboardButton(f"{EMOJI['update']} Update Status", callback_data=f'update_status_{order_id}')],
+            [InlineKeyboardButton(f"{EMOJI['link']} Add/Update Tracking", callback_data=f'add_tracking_{order_id}')],
+            [InlineKeyboardButton(f"{EMOJI['screenshot']} View Payment Screenshot", callback_data=f'view_payment_{order_id}')]
+        ]
+        
+        # Add back button
+        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')])
+        
+        self.loggers["admin"].info(f"Admin viewing order details for {order_id}")
+        
+        # Send or edit the message based on update type
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True  # Prevent tracking links from generating previews
+            )
+        else:
+            await update.message.reply_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True
+            )
     
-    # Get orders
-    orders = sheet.get_all_records()
-    
-    # Find payment URL
-    payment_url = None
-    for order in orders:
-        if order.get('Order ID') == order_id and order.get('Product') == "COMPLETE ORDER":
-            payment_url = order.get('Payment URL')
-            break
-    
-    if not payment_url:
+    async def view_payment_screenshot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Send the payment screenshot to the admin.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Get order ID from context or callback data
+        order_id = context.user_data.get('current_order_id')
+        if not order_id:
+            order_id = query.data.replace('view_payment_', '')
+        
+        # Get order details
+        order_details = await self.order_manager.get_order_details(order_id)
+        
+        if not order_details:
+            await query.edit_message_text(
+                MESSAGES["order_not_found"].format(order_id),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                ])
+            )
+            return
+        
+        # Find payment URL
+        payment_url = order_details.get('Payment URL')
+        
+        if not payment_url:
+            await query.edit_message_text(
+                ERRORS["no_screenshot"],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
+                ])
+            )
+            return
+        
+        self.loggers["admin"].info(f"Admin viewed payment screenshot for order {order_id}")
+        
+        # Send the payment URL
         await query.edit_message_text(
-            ERRORS["no_screenshot"],
+            f"{EMOJI['screenshot']} Payment Screenshot for Order {order_id}:\n\n"
+            f"Link: {payment_url}\n\n"
+            "You can view the screenshot by clicking the link above.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
             ])
         )
-        return
     
-    loggers["admin"].info(f"Admin viewed payment screenshot for order {order_id}")
-    
-    # Send the payment URL
-    await query.edit_message_text(
-        f"{EMOJI['screenshot']} Payment Screenshot for Order {order_id}:\n\n"
-        f"Link: {payment_url}\n\n"
-        "You can view the screenshot by clicking the link above.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
-        ])
-    )
-
-async def update_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE, loggers):
-    """
-    Handle updating order status from admin panel.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        loggers: Dictionary of logger instances
+    async def update_order_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle updating order status from admin panel.
         
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Extract the order ID from callback data
-    order_id = query.data.replace('update_status_', '')
-    
-    # Store the order ID in context for later use
-    context.user_data['current_order_id'] = order_id
-    
-    # Provide status options based on STATUS dictionary
-    keyboard = []
-    
-    for status_key, status_info in STATUS.items():
-        label = status_info["label"]
-        emoji = status_info["emoji"]
-        keyboard.append([
-            InlineKeyboardButton(f"{emoji} {label}", callback_data=f'set_status_{status_key}')
-        ])
-    
-    # Add back button
-    keyboard.append([
-        InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')
-    ])
-    
-    loggers["admin"].info(f"Admin preparing to update status for order {order_id}")
-    
-    await query.edit_message_text(
-        f"Select new status for Order {order_id}:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def set_order_status(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    order_manager, loggers
-):
-    """
-    Set the new status for an order and notify the customer.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        order_manager: OrderManager instance
-        loggers: Dictionary of logger instances
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
         
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Get the order ID and status key
-    order_id = context.user_data.get('current_order_id')
-    status_key = query.data.replace('set_status_', '')
-    
-    if not order_id:
-        await query.edit_message_text(
-            f"{EMOJI['error']} Error: No order selected."
-        )
-        return
-    
-    # Get the label for this status
-    if status_key in STATUS:
-        new_status = STATUS[status_key]["label"]
-    else:
-        new_status = status_key.replace('_', ' ').title()
-    
-    # If status is being set to "Booked", prompt for tracking
-    if status_key.lower() == "booked":
-        context.user_data['pending_status'] = new_status
-        await query.edit_message_text(
-            f"You're setting Order {order_id} to '{new_status}'.\n\n"
-            f"Would you like to add a tracking link?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Yes, Add Tracking Link", callback_data='add_tracking_link')],
-                [InlineKeyboardButton("No, Skip Tracking Link", callback_data='skip_tracking_link')]
+        # Extract the order ID from callback data
+        order_id = query.data.replace('update_status_', '')
+        
+        # Store the order ID in context for later use
+        context.user_data['current_order_id'] = order_id
+        
+        # Provide status options based on STATUS dictionary
+        keyboard = []
+        
+        for status_key, status_info in STATUS.items():
+            label = status_info["label"]
+            emoji = status_info["emoji"]
+            keyboard.append([
+                InlineKeyboardButton(f"{emoji} {label}", callback_data=f'set_status_{status_key}')
             ])
-        )
-        return
-    
-    # For other statuses, proceed with the update directly
-    success = await order_manager.update_order_status(context, order_id, new_status)
-    
-    loggers["admin"].info(f"Admin updated order {order_id} status to {new_status}")
-    
-    if success:
-        keyboard = [
-            [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
-        ]
+        
+        # Add back button
+        keyboard.append([
+            InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')
+        ])
+        
+        self.loggers["admin"].info(f"Admin preparing to update status for order {order_id}")
         
         await query.edit_message_text(
-            MESSAGES["status_updated"].format(new_status, order_id),
+            f"Select new status for Order {order_id}:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    else:
-        await query.edit_message_text(
-            ERRORS["update_failed"].format(order_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
-            ])
-        )
-
-async def add_tracking_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle adding or updating tracking link.
     
-    Args:
-        update: Telegram update
-        context: Conversation context
+    async def set_order_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Set the new status for an order and notify the customer.
         
-    Returns:
-        int: Next conversation state or None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Get the order ID from context or callback data
-    order_id = context.user_data.get('current_order_id')
-    if not order_id:
-        order_id = query.data.replace('add_tracking_', '')
-        context.user_data['current_order_id'] = order_id
-    
-    # Store that we're waiting for a tracking link
-    context.user_data['awaiting_tracking_link'] = True
-    context.user_data['tracking_source'] = 'direct'  # vs. from status update
-    
-    await query.edit_message_text(
-        f"Please send the tracking link for Order {order_id} as a message.\n\n"
-        f"Example: https://share.lalamove.com/...\n\n"
-        f"Type 'skip' to continue without adding a link.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"{EMOJI['back']} Cancel", callback_data=f'manage_order_{order_id}')]
-        ])
-    )
-    
-    return ADMIN_TRACKING
-
-async def receive_tracking_link(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    order_manager, loggers
-):
-    """
-    Handle receiving a tracking link from admin's message.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        order_manager: OrderManager instance
-        loggers: Dictionary of logger instances
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
         
-    Returns:
-        None
-    """
-    # Only process if we're waiting for a tracking link
-    if not context.user_data.get('awaiting_tracking_link'):
-        return
-    
-    # Clear the flag
-    context.user_data['awaiting_tracking_link'] = False
-    
-    user = update.message.from_user
-    
-    # Get the tracking link from the message
-    tracking_link = sanitize_input(update.message.text.strip(), 200)
-    
-    # Skip if the admin typed 'skip'
-    if tracking_link.lower() == 'skip':
-        tracking_link = ""
-    
-    # Get the stored order details
-    order_id = context.user_data.get('current_order_id')
-    
-    if not order_id:
-        await update.message.reply_text(f"{EMOJI['error']} Error: Missing order details.")
-        return
-    
-    # Check if this is from a status update or direct tracking link addition
-    tracking_source = context.user_data.get('tracking_source', 'direct')
-    
-    if tracking_source == 'direct':
-        # Update just the tracking link
-        status, _, _ = await order_manager.get_order_status(order_id)
+        # Get the order ID and status key
+        order_id = context.user_data.get('current_order_id')
+        status_key = query.data.replace('set_status_', '')
         
-        if not status:
-            await update.message.reply_text(MESSAGES["order_not_found"].format(order_id))
+        if not order_id:
+            await query.edit_message_text(
+                f"{EMOJI['error']} Error: No order selected."
+            )
             return
         
-        # Update both status and tracking
-        success = await order_manager.update_order_status(context, order_id, status, tracking_link)
-        
-        loggers["admin"].info(f"Admin added tracking link for order {order_id}")
-        
-        if success:
-            keyboard = [
-                [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
-            ]
-            
-            await update.message.reply_text(
-                MESSAGES["tracking_updated"].format(order_id),
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+        # Get the label for this status
+        if status_key in STATUS:
+            new_status = STATUS[status_key]["label"]
         else:
-            await update.message.reply_text(ERRORS["update_failed"].format(order_id))
+            new_status = status_key.replace('_', ' ').title()
         
-    else:
-        # This is from a status update
-        new_status = context.user_data.get('pending_status')
-        
-        if not new_status:
-            await update.message.reply_text(f"{EMOJI['error']} Error: Missing status information.")
+        # If status is being set to "Booked", prompt for tracking
+        if status_key.lower() == "booked":
+            context.user_data['pending_status'] = new_status
+            await query.edit_message_text(
+                f"You're setting Order {order_id} to '{new_status}'.\n\n"
+                f"Would you like to add a tracking link?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Yes, Add Tracking Link", callback_data='add_tracking_link')],
+                    [InlineKeyboardButton("No, Skip Tracking Link", callback_data='skip_tracking_link')]
+                ])
+            )
             return
         
-        # Update both status and tracking link
-        success = await order_manager.update_order_status(context, order_id, new_status, tracking_link)
+        # For other statuses, proceed with the update directly
+        success = await self.order_manager.update_order_status(context, order_id, new_status)
         
-        loggers["admin"].info(f"Admin updated order {order_id} status to {new_status} with tracking")
-        
-        if success:
-            keyboard = [
-                [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
-            ]
-            
-            await update.message.reply_text(
-                f"{MESSAGES['status_updated'].format(new_status, order_id)} with tracking link.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
-            await update.message.reply_text(ERRORS["update_failed"].format(order_id))
-
-async def skip_tracking_link(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, 
-    order_manager, loggers
-):
-    """
-    Skip adding a tracking link and proceed with the status update.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        order_manager: OrderManager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    order_id = context.user_data.get('current_order_id')
-    new_status = context.user_data.get('pending_status')
-    
-    if not order_id:
-        await query.edit_message_text(f"{EMOJI['error']} Error: Missing order details.")
-        return
-    
-    # If this is from a status update
-    if new_status:
-        success = await order_manager.update_order_status(context, order_id, new_status, "")
-        
-        loggers["admin"].info(f"Admin updated order {order_id} status to {new_status} without tracking")
+        self.loggers["admin"].info(f"Admin updated order {order_id} status to {new_status}")
         
         if success:
             keyboard = [
@@ -4370,422 +3771,496 @@ async def skip_tracking_link(
                     [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
                 ])
             )
-    else:
-        # Direct tracking link update was cancelled
-        await query.edit_message_text(
-            f"Tracking link update cancelled for Order {order_id}.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
-            ])
-        )
-
-async def back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Return to the admin panel.
     
-    Args:
-        update: Telegram update
-        context: Conversation context
+    async def add_tracking_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle adding or updating tracking link.
         
-    Returns:
-        None
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        MESSAGES["admin_welcome"],
-        reply_markup=build_admin_buttons()
-    )
-
-async def search_order_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Display a prompt for entering an order ID to search.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        
-    Returns:
-        int: Next conversation state
-    """
-    query = update.callback_query
-    await query.answer()
-    
-    # Let user know we're expecting an order ID
-    await query.edit_message_text(
-        f"{EMOJI['search']} Please enter the Order ID you want to search for:\n\n"
-        f"Example: WW-1234-ABC",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data="back_to_admin")]
-        ])
-    )
-    
-    # Set context to indicate we're waiting for an order ID
-    context.user_data['awaiting_order_id'] = True
-    
-    # Return the ADMIN_SEARCH state to wait for text input
-    return ADMIN_SEARCH
-
-async def handle_admin_search(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers):
-    """
-    Handle order ID input for order searching.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        google_apis: GoogleAPIsManager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        int: Next conversation state
-    """
-    # Only process if we're awaiting an order ID
-    if not context.user_data.get('awaiting_order_id', False):
-        return
-    
-    # Clear the flag
-    context.user_data['awaiting_order_id'] = False
-    
-    # Get the order ID from message
-    order_id = update.message.text.strip()
-    
-    # Log the search attempt
-    user = update.message.from_user
-    loggers["admin"].info(f"Admin {user.id} searched for order {order_id}")
-    
-    # Initialize sheets
-    sheet, _ = await google_apis.initialize_sheets()
-    if not sheet:
-        await update.message.reply_text(
-            f"{EMOJI['error']} Failed to access order data. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Get orders
-    orders = sheet.get_all_records()
-    
-    # Find the order
-    found_order = None
-    for order in orders:
-        if order.get('Order ID') == order_id and order.get('Product') == "COMPLETE ORDER":
-            found_order = order
-            break
-    
-    if not found_order:
-        await update.message.reply_text(
-            MESSAGES["order_not_found"].format(order_id),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
-            ])
-        )
-        return
-    
-    # Create detailed order message with safe gets
-    customer = found_order.get('Customer Name', found_order.get('Name', 'Unknown'))
-    address = found_order.get('Address', 'No address provided')
-    contact = found_order.get('Contact', found_order.get('Phone', 'No contact provided'))
-    status = found_order.get('Status', 'Unknown')
-    date = found_order.get('Order Date', 'N/A')
-    total = found_order.get('Price', found_order.get('Total Price', '₱0'))
-    payment_url = found_order.get('Payment URL', 'N/A')
-    tracking_link = found_order.get('Tracking Link', '')
-    
-    message = (
-        f"{EMOJI['search']} Order Details: {order_id}\n\n"
-        f"{EMOJI['customer']} Customer: {customer}\n"
-        f"{EMOJI['phone']} Contact: {contact}\n"
-        f"{EMOJI['address']} Address: {address}\n"
-        f"{EMOJI['date']} Date: {date}\n"
-        f"{EMOJI['status']} Status: {status}\n"
-        f"{EMOJI['money']} Total: {total}\n\n"
-    )
-    
-    # Add tracking link if available
-    if tracking_link:
-        message += f"{EMOJI['link']} Tracking: {tracking_link}\n\n"
-    
-    # Add order items from Notes field
-    message += f"{EMOJI['cart']} Items:\n{found_order.get('Notes', '• No detailed items found')}\n"
-    
-    # Create management buttons
-    keyboard = [
-        [InlineKeyboardButton(f"{EMOJI['update']} Update Status", callback_data=f'update_status_{order_id}')],
-        [InlineKeyboardButton(f"{EMOJI['link']} Add/Update Tracking", callback_data=f'add_tracking_{order_id}')],
-        [InlineKeyboardButton(f"{EMOJI['screenshot']} View Payment Screenshot", callback_data=f'view_payment_{order_id}')]
-    ]
-    
-    # Add back button
-    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')])
-    
-    await update.message.reply_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True  # Prevent tracking links from generating previews
-    )
-# ---------------------------- Conversation Cancellation & Utilities ----------------------------
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Cancel the current conversation.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        
-    Returns:
-        int: ConversationHandler.END
-    """
-    # Clear the user's cart
-    manage_cart(context, "clear")
-    
-    # Log the cancellation
-    user = update.message.from_user
-    loggers["main"].info(f"User {user.id} cancelled their order")
-    
-    await update.message.reply_text(MESSAGES["cancel_order"])
-    return ConversationHandler.END
-
-async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle conversation timeout.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        
-    Returns:
-        int: ConversationHandler.END
-    """
-    user = update.effective_user
-    
-    loggers["main"].info(f"Conversation timed out for user {user.id}")
-    
-    await context.bot.send_message(
-        chat_id=user.id,
-        text=ERRORS["timeout"]
-    )
-    return ConversationHandler.END
-
-async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin command to check system health.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-    """
-    user_id = update.message.from_user.id
-    
-    # Verify admin status
-    if user_id != ADMIN_ID:
-        await update.message.reply_text(ERRORS["not_authorized"])
-        return
-    
-    # Start health check
-    message = await update.message.reply_text(f"{EMOJI['info']} Performing system health check...")
-    
-    results = {
-        "database": True,
-        "google_sheets": True,
-        "google_drive": True,
-        "message_system": True
-    }
-    
-    try:
-        # Check Google Sheets connection
-        sheet, _ = await google_apis.initialize_sheets()
-        if not sheet:
-            results["google_sheets"] = False
-    except Exception as e:
-        results["google_sheets"] = False
-        loggers["errors"].error(f"Google Sheets health check failed: {e}")
-    
-    try:
-        # Check Google Drive connection
-        drive_service = await google_apis.get_drive_service()
-        if not drive_service:
-            results["google_drive"] = False
-    except Exception as e:
-        results["google_drive"] = False
-        loggers["errors"].error(f"Google Drive health check failed: {e}")
-    
-    # Format results
-    status_text = f"{EMOJI['search']} System Health Report:\n\n"
-    for system, status in results.items():
-        emoji = EMOJI["success"] if status else EMOJI["error"]
-        status_text += f"{emoji} {system.replace('_', ' ').title()}: {'Online' if status else 'Offline'}\n"
-    
-    # Add system stats
-    uptime = time.time() - context.bot_data.get("start_time", time.time())
-    hours, remainder = divmod(uptime, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    status_text += f"\n{EMOJI['time']} Uptime: {int(hours)}h {int(minutes)}m {int(seconds)}s"
-    
-    await message.edit_text(status_text)
-
-# ---------------------------- Error Handling ----------------------------
-async def error_handler(update, context):
-    """
-    Global error handler for the bot.
-    Logs errors and notifies users.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-    """
-    # Log the error
-    log_error(loggers["errors"], "error_handler", context.error)
-    
-    # Notify user if possible
-    if update and update.effective_user:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=ERRORS["error"]
-            )
-        except Exception as error:
-            loggers["errors"].error(f"Failed to send error message to the user: {error}")
-
-async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Enhanced error handler for catching and logging errors, and notifying users.
-    
-    Args:
-        update: Telegram update that caused the error
-        context: Context with error details
-    """
-    # Get the exception from the context
-    error = context.error
-    
-    # Get user and chat information
-    user_id = None
-    chat_id = None
-    message_id = None
-    
-    try:
-        if update and update.effective_user:
-            user_id = update.effective_user.id
-        if update and update.effective_chat:
-            chat_id = update.effective_chat.id
-        if update and update.effective_message:
-            message_id = update.effective_message.message_id
-    except Exception as e:
-        loggers["errors"].error(f"Error retrieving user/chat information: {e}")
-    
-    # Log the error details
-    error_text = f"User: {user_id} | Chat: {chat_id} | Error: {type(error).__name__}: {error}"
-    loggers["errors"].error(f"Error in enhanced_error_handler | {error_text}")
-    
-    # Generate a unique error reference code
-    error_ref = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    loggers["errors"].error(f"Error reference: {error_ref} | {error_text}")
-    
-    # Send a notification to admin about the error
-    try:
-        for admin_id in ADMIN_ID:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"{EMOJI['error']} *BOT ERROR ALERT* {EMOJI['error']}\n\n"
-                    f"*Error Reference:* `{error_ref}`\n"
-                    f"*Type:* `{type(error).__name__}`\n"
-                    f"*Details:* `{error}`\n"
-                    f"*User ID:* `{user_id}`\n"
-                    f"*Chat ID:* `{chat_id}`\n"
-                    f"*Time:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-                ),
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        loggers["errors"].error(f"Failed to notify admin about error: {e}")
-    
-    # Provide user-friendly error message and recovery options
-    try:
-        if chat_id:
-            # Create recovery keyboard
-            keyboard = [
-                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
-                [InlineKeyboardButton(f"{EMOJI['help']} Get Help", callback_data="get_help")],
-                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
-            ]
+        Args:
+            update: Telegram update
+            context: Conversation context
             
-            # Determine the message based on error type
-            if isinstance(error, (NetworkError, TelegramError, TimedOut)):
-                error_message = (
-                    f"{EMOJI['warning']} *Oops! Connection issue detected*\n\n"
-                    f"The bot is having trouble connecting to Telegram servers. "
-                    f"This could be due to network issues or server load.\n\n"
-                    f"*What you can do:*\n"
-                    f"• Wait a moment and try again\n"
-                    f"• Restart the conversation using the button below\n"
-                    f"• Contact support if the issue persists\n\n"
-                    f"Error Reference: `{error_ref}`"
-                )
-            elif isinstance(error, ConversationTimeout):
-                error_message = (
-                    f"{EMOJI['clock']} *Conversation Timed Out*\n\n"
-                    f"Your session was inactive for too long and has been reset. "
-                    f"Don't worry, your data is safe!\n\n"
-                    f"Use the buttons below to restart."
+        Returns:
+            int: Next conversation state or None
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Get the order ID from context or callback data
+        order_id = context.user_data.get('current_order_id')
+        if not order_id:
+            order_id = query.data.replace('add_tracking_', '')
+            context.user_data['current_order_id'] = order_id
+        
+        # Store that we're waiting for a tracking link
+        context.user_data['awaiting_tracking_link'] = True
+        context.user_data['tracking_source'] = 'direct'  # vs. from status update
+        
+        await query.edit_message_text(
+            f"Please send the tracking link for Order {order_id} as a message.\n\n"
+            f"Example: https://share.lalamove.com/...\n\n"
+            f"Type 'skip' to continue without adding a link.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Cancel", callback_data=f'manage_order_{order_id}')]
+            ])
+        )
+        
+        return ADMIN_TRACKING
+    
+    async def receive_tracking_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle receiving a tracking link from admin's message.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+            
+        Returns:
+            None
+        """
+        # Only process if we're waiting for a tracking link
+        if not context.user_data.get('awaiting_tracking_link'):
+            return
+        
+        # Clear the flag
+        context.user_data['awaiting_tracking_link'] = False
+        
+        user = update.message.from_user
+        
+        # Get the tracking link from the message
+        tracking_link = sanitize_input(update.message.text.strip(), 200)
+        
+        # Skip if the admin typed 'skip'
+        if tracking_link.lower() == 'skip':
+            tracking_link = ""
+        
+        # Get the stored order details
+        order_id = context.user_data.get('current_order_id')
+        
+        if not order_id:
+            await update.message.reply_text(f"{EMOJI['error']} Error: Missing order details.")
+            return
+        
+        # Check if this is from a status update or direct tracking link addition
+        tracking_source = context.user_data.get('tracking_source', 'direct')
+        
+        if tracking_source == 'direct':
+            # Update just the tracking link
+            status, _, _ = await self.order_manager.get_order_status(order_id)
+            
+            if not status:
+                await update.message.reply_text(MESSAGES["order_not_found"].format(order_id))
+                return
+            
+            # Update both status and tracking
+            success = await self.order_manager.update_order_status(context, order_id, status, tracking_link)
+            
+            self.loggers["admin"].info(f"Admin added tracking link for order {order_id}")
+            
+            if success:
+                keyboard = [
+                    [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                ]
+                
+                await update.message.reply_text(
+                    MESSAGES["tracking_updated"].format(order_id),
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
-                error_message = (
-                    f"{EMOJI['error']} *Something went wrong*\n\n"
-                    f"The bot encountered an unexpected error while processing your request. "
-                    f"Our team has been notified and is working to fix it.\n\n"
-                    f"*What you can do:*\n"
-                    f"• Restart the conversation using the button below\n"
-                    f"• Try again later if the issue persists\n"
-                    f"• Contact support with reference code: `{error_ref}`"
-                )
+                await update.message.reply_text(ERRORS["update_failed"].format(order_id))
             
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=error_message,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # End any ongoing conversation
-            return ConversationHandler.END
-            
-    except Exception as e:
-        loggers["errors"].error(f"Failed to send error message to the user: {e}")
-
-async def navigation_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle errors that occur during navigation.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-    """
-    error = context.error
-    user_id = update.effective_user.id if update.effective_user else "Unknown"
-    
-    # Log the error
-    loggers["errors"].error(f"Navigation error for user {user_id}: {error}")
-    
-    # Try to recover by returning to categories
-    try:
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                f"{EMOJI['error']} An error occurred while navigating. Let's start again.",
-                reply_markup=build_category_buttons([k for k in PRODUCTS.keys()])
-            )
         else:
-            await update.message.reply_text(
-                f"{EMOJI['error']} An error occurred while navigating. Let's start again.",
-                reply_markup=build_category_buttons([k for k in PRODUCTS.keys()])
+            # This is from a status update
+            new_status = context.user_data.get('pending_status')
+            
+            if not new_status:
+                await update.message.reply_text(f"{EMOJI['error']} Error: Missing status information.")
+                return
+            
+            # Update both status and tracking link
+            success = await self.order_manager.update_order_status(context, order_id, new_status, tracking_link)
+            
+            self.loggers["admin"].info(f"Admin updated order {order_id} status to {new_status} with tracking")
+            
+            if success:
+                keyboard = [
+                    [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                ]
+                
+                await update.message.reply_text(
+                    f"{MESSAGES['status_updated'].format(new_status, order_id)} with tracking link.",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await update.message.reply_text(ERRORS["update_failed"].format(order_id))
+    
+    async def skip_tracking_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Skip adding a tracking link and proceed with the status update.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        order_id = context.user_data.get('current_order_id')
+        new_status = context.user_data.get('pending_status')
+        
+        if not order_id:
+            await query.edit_message_text(f"{EMOJI['error']} Error: Missing order details.")
+            return
+        
+        # If this is from a status update
+        if new_status:
+            success = await self.order_manager.update_order_status(context, order_id, new_status, "")
+            
+            self.loggers["admin"].info(f"Admin updated order {order_id} status to {new_status} without tracking")
+            
+            if success:
+                keyboard = [
+                    [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                ]
+                
+                await query.edit_message_text(
+                    MESSAGES["status_updated"].format(new_status, order_id),
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await query.edit_message_text(
+                    ERRORS["update_failed"].format(order_id),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                    ])
+                )
+        else:
+            # Direct tracking link update was cancelled
+            await query.edit_message_text(
+                f"Tracking link update cancelled for Order {order_id}.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
+                ])
             )
-        return CATEGORY
-    except Exception as e:
-        loggers["errors"].error(f"Failed to recover from navigation error: {e}")
+            
+    async def back_to_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Return to the admin panel.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        await query.edit_message_text(
+            MESSAGES["admin_welcome"],
+            reply_markup=self._build_admin_buttons()
+        )
+        
+    async def search_order_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Display a prompt for entering an order ID to search.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+            
+        Returns:
+            int: Next conversation state
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Let user know we're expecting an order ID
+        await query.edit_message_text(
+            f"{EMOJI['search']} Please enter the Order ID you want to search for:\n\n"
+            f"Example: WW-1234-ABC",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data="back_to_admin")]
+            ])
+        )
+        
+        # Set context to indicate we're waiting for an order ID
+        context.user_data['awaiting_order_id'] = True
+        
+        # Return the ADMIN_SEARCH state to wait for text input
+        return ADMIN_SEARCH
+        
+    async def handle_admin_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle order ID input for order searching.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+            
+        Returns:
+            int: Next conversation state
+        """
+        # Only process if we're awaiting an order ID
+        if not context.user_data.get('awaiting_order_id', False):
+            return
+        
+        # Clear the flag
+        context.user_data['awaiting_order_id'] = False
+        
+        # Get the order ID from message
+        order_id = update.message.text.strip()
+        
+        # Log the search attempt
+        user = update.message.from_user
+        self.loggers["admin"].info(f"Admin {user.id} searched for order {order_id}")
+        
+        # Get the order details directly and display using manage_order
+        await self.manage_order(update, context, order_id)
+        
         return ConversationHandler.END
     
+    async def review_payments(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Display a list of orders with pending payment status for review.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Log the action
+        user = query.from_user
+        self.loggers["admin"].info(f"Admin {user.id} accessed payment review")
+        
+        # Initialize sheets
+        sheet, _ = await self.google_apis.initialize_sheets()
+        if not sheet:
+            await query.edit_message_text(
+                f"{EMOJI['error']} Failed to access order data. Please try again later.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                ])
+            )
+            return
+        
+        # Get orders
+        orders = sheet.get_all_records()
+        
+        # Filter for orders with pending payment status
+        pending_payments = []
+        for order in orders:
+            if (order.get('Product') == "COMPLETE ORDER" and 
+                order.get('Status', '').lower() == "pending payment review"):
+                pending_payments.append(order)
+        
+        # Check if we have any pending payments
+        if not pending_payments:
+            await query.edit_message_text(
+                f"{EMOJI['info']} No orders pending payment review at this time.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                ])
+            )
+            return
+        
+        # Sort by date (newest first)
+        pending_payments.sort(key=lambda x: x.get('Order Date', ''), reverse=True)
+        
+        # Create a message with pending payment orders (show up to 5)
+        message = f"{EMOJI['payment']} Orders Pending Payment Review:\n\n"
+        
+        display_orders = pending_payments[:5]
+        
+        # Create order buttons
+        payment_buttons = []
+        for order in display_orders:
+            order_id = order.get('Order ID', 'Unknown')
+            customer = order.get('Customer Name', order.get('Name', 'Unknown Customer'))
+            date = order.get('Order Date', 'N/A')
+            total = order.get('Price', order.get('Total Price', '₱0'))
+            
+            # Add order summary to message
+            message += (
+                f"{EMOJI['id']} {order_id}\n"
+                f"{EMOJI['customer']} {customer}\n"
+                f"{EMOJI['money']} {total}\n"
+                f"{EMOJI['date']} {date}\n"
+                f"------------------------\n"
+            )
+            
+            # Add button for this order
+            payment_buttons.append([
+                InlineKeyboardButton(
+                    f"Review: {order_id}", 
+                    callback_data=f'review_payment_{order_id}'
+                )
+            ])
+        
+        # Create navigation buttons if there are more orders
+        nav_buttons = []
+        if len(pending_payments) > 5:
+            nav_buttons = [[
+                InlineKeyboardButton("◀️ Previous", callback_data="prev_payments"),
+                InlineKeyboardButton("Next ▶️", callback_data="next_payments")
+            ]]
+        
+        # Combine all buttons
+        keyboard = (
+            payment_buttons + 
+            nav_buttons + 
+            [[InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]]
+        )
+        
+        await query.edit_message_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    async def review_specific_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Review a specific payment and provide options to approve or reject.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Extract order ID from callback data
+        order_id = query.data.replace('review_payment_', '')
+        
+        # Store order ID in context
+        context.user_data['current_order_id'] = order_id
+        
+        # Get order details
+        order_details = await self.order_manager.get_order_details(order_id)
+        
+        if not order_details:
+            await query.edit_message_text(
+                MESSAGES["order_not_found"].format(order_id),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Payment Review", callback_data='approve_payments')]
+                ])
+            )
+            return
+        
+        # Extract order information
+        customer = order_details.get('Customer Name', order_details.get('Name', 'Unknown'))
+        address = order_details.get('Address', 'No address provided')
+        contact = order_details.get('Contact', order_details.get('Phone', 'No contact provided'))
+        status = order_details.get('Status', 'Unknown')
+        date = order_details.get('Order Date', 'N/A')
+        total = order_details.get('Price', order_details.get('Total Price', '₱0'))
+        payment_url = order_details.get('Payment URL', 'N/A')
+        
+        # Build message
+        message = (
+            f"{EMOJI['payment']} Payment Review: {order_id}\n\n"
+            f"{EMOJI['customer']} Customer: {customer}\n"
+            f"{EMOJI['phone']} Contact: {contact}\n"
+            f"{EMOJI['address']} Address: {address}\n"
+            f"{EMOJI['date']} Date: {date}\n"
+            f"{EMOJI['status']} Status: {status}\n"
+            f"{EMOJI['money']} Total: {total}\n\n"
+            f"{EMOJI['screenshot']} Payment Screenshot: {payment_url}\n\n"
+            f"{EMOJI['cart']} Items:\n{order_details.get('Notes', '• No detailed items found')}\n\n"
+            f"Please verify the payment screenshot and select an action below:"
+        )
+        
+        # Create action buttons
+        keyboard = [
+            [InlineKeyboardButton(f"{EMOJI['success']} Approve Payment", callback_data=f'approve_payment_{order_id}')],
+            [InlineKeyboardButton(f"{EMOJI['error']} Reject Payment", callback_data=f'reject_payment_{order_id}')],
+            [InlineKeyboardButton(f"{EMOJI['back']} Back to Payment Review", callback_data='approve_payments')]
+        ]
+        
+        # Log the action
+        self.loggers["admin"].info(f"Admin reviewing payment for order {order_id}")
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+        
+    async def process_payment_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Process payment approval or rejection.
+        
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Determine action type and order ID
+        action_data = query.data
+        order_id = context.user_data.get('current_order_id')
+        
+        if not order_id:
+            # Extract from callback data as fallback
+            if action_data.startswith('approve_payment_'):
+                order_id = action_data.replace('approve_payment_', '')
+            elif action_data.startswith('reject_payment_'):
+                order_id = action_data.replace('reject_payment_', '')
+        
+        if not order_id:
+            await query.edit_message_text(
+                f"{EMOJI['error']} Error: Order ID not found.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                ])
+            )
+            return
+        
+        # Set new status based on action
+        if action_data.startswith('approve_payment_'):
+            new_status = STATUS["payment_confirmed"]["label"]
+            action_type = "approved"
+        elif action_data.startswith('reject_payment_'):
+            new_status = STATUS["payment_rejected"]["label"]
+            action_type = "rejected"
+        else:
+            await query.edit_message_text(
+                f"{EMOJI['error']} Invalid action selected.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                ])
+            )
+            return
+        
+        # Update order status
+        success = await self.order_manager.update_order_status(context, order_id, new_status)
+        
+        if success:
+            # Log the action
+            self.loggers["admin"].info(f"Admin {action_type} payment for order {order_id}")
+            
+            keyboard = [
+                [InlineKeyboardButton("Back to Payment Review", callback_data='approve_payments')],
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ]
+            
+            await query.edit_message_text(
+                f"{EMOJI['success']} Payment for Order {order_id} has been {action_type}.\n\n"
+                f"Status updated to: {new_status}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text(
+                ERRORS["update_failed"].format(order_id),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                ])
+            )
+
+# ---------------------------- Error Handling and Middleware ----------------------------
 class HealthCheckMiddleware:
     """Middleware to track response times and detect when the bot becomes unresponsive."""
     
@@ -4873,6 +4348,210 @@ class ActivityTrackerMiddleware:
                 # Update the last activity time
                 context.user_data['last_activity_time'] = time.time()
 
+class ConversationTimeout(Exception):
+    """Exception raised when a conversation times out."""
+    pass
+
+async def error_handler(update, context):
+    """
+    Global error handler for the bot.
+    Logs errors and notifies users.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    # Log the error
+    log_error(loggers["errors"], "error_handler", context.error)
+    
+    # Notify user if possible
+    if update and update.effective_user:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=ERRORS["error"]
+            )
+        except Exception as error:
+            loggers["errors"].error(f"Failed to send error message to the user: {error}")
+
+async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Enhanced error handler for catching and logging errors, and notifying users.
+    
+    Args:
+        update: Telegram update that caused the error
+        context: Context with error details
+    """
+    # Get the exception from the context
+    error = context.error
+    
+    # Get user and chat information
+    user_id = None
+    chat_id = None
+    message_id = None
+    
+    try:
+        if update and update.effective_user:
+            user_id = update.effective_user.id
+        if update and update.effective_chat:
+            chat_id = update.effective_chat.id
+        if update and update.effective_message:
+            message_id = update.effective_message.message_id
+    except Exception as e:
+        loggers["errors"].error(f"Error retrieving user/chat information: {e}")
+    
+    # Log the error details
+    error_text = f"User: {user_id} | Chat: {chat_id} | Error: {type(error).__name__}: {error}"
+    loggers["errors"].error(f"Error in enhanced_error_handler | {error_text}")
+    
+    # Generate a unique error reference code
+    error_ref = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    loggers["errors"].error(f"Error reference: {error_ref} | {error_text}")
+    
+    # Send a notification to admin about the error
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"{EMOJI['error']} *BOT ERROR ALERT* {EMOJI['error']}\n\n"
+                f"*Error Reference:* `{error_ref}`\n"
+                f"*Type:* `{type(error).__name__}`\n"
+                f"*Details:* `{error}`\n"
+                f"*User ID:* `{user_id}`\n"
+                f"*Chat ID:* `{chat_id}`\n"
+                f"*Time:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        loggers["errors"].error(f"Failed to notify admin about error: {e}")
+    
+    # Provide user-friendly error message and recovery options
+    try:
+        if chat_id:
+            # Create recovery keyboard
+            keyboard = [
+                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
+                [InlineKeyboardButton(f"{EMOJI['help']} Get Help", callback_data="get_help")],
+                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+            ]
+            
+            # Determine the message based on error type
+            if isinstance(error, (NetworkError, TelegramError, TimedOut)):
+                error_message = (
+                    f"{EMOJI['warning']} *Connection issue detected*\n\n"
+                    f"The bot is having trouble connecting to Telegram servers. "
+                    f"This could be due to network issues or server load.\n\n"
+                    f"*What you can do:*\n"
+                    f"• Wait a moment and try again\n"
+                    f"• Restart the conversation using the button below\n"
+                    f"• Contact support if the issue persists\n\n"
+                    f"Error Reference: `{error_ref}`"
+                )
+            elif isinstance(error, ConversationTimeout):
+                error_message = (
+                    f"{EMOJI['clock']} *Conversation Timed Out*\n\n"
+                    f"Your session was inactive for too long and has been reset. "
+                    f"Don't worry, your data is safe!\n\n"
+                    f"Use the buttons below to restart."
+                )
+            else:
+                error_message = (
+                    f"{EMOJI['error']} *Something went wrong*\n\n"
+                    f"The bot encountered an unexpected error while processing your request. "
+                    f"Our team has been notified and is working to fix it.\n\n"
+                    f"*What you can do:*\n"
+                    f"• Restart the conversation using the button below\n"
+                    f"• Try again later if the issue persists\n"
+                    f"• Contact support with reference code: `{error_ref}`"
+                )
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=error_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # End any ongoing conversation
+            return ConversationHandler.END
+            
+    except Exception as e:
+        loggers["errors"].error(f"Failed to send error message to the user: {e}")
+
+async def navigation_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle errors that occur during navigation.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    error = context.error
+    user_id = update.effective_user.id if update.effective_user else "Unknown"
+    
+    # Log the error
+    loggers["errors"].error(f"Navigation error for user {user_id}: {error}")
+    
+    # Try to recover by returning to categories
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                f"{EMOJI['error']} An error occurred while navigating. Let's start again.",
+                reply_markup=build_category_buttons([k for k in PRODUCTS.keys()])
+            )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['error']} An error occurred while navigating. Let's start again.",
+                reply_markup=build_category_buttons([k for k in PRODUCTS.keys()])
+            )
+        return CATEGORY
+    except Exception as e:
+        loggers["errors"].error(f"Failed to recover from navigation error: {e}")
+        return ConversationHandler.END
+
+async def check_conversation_status(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job to check if conversations have been idle for too long and offer recovery.
+    This runs periodically to check for stuck conversations.
+    
+    Args:
+        context: Application context containing bot data
+    """
+    now = time.time()
+    bot = context.bot
+    
+    # Get all active conversations that might have stalled
+    for user_id, user_data in context.application.user_data.items():
+        # Check if this user has been inactive for more than 10 minutes
+        last_activity = user_data.get('last_activity_time', 0)
+        
+        if last_activity and now - last_activity > 600:  # 10 minutes
+            # This user's conversation may be stalled
+            try:
+                # Only send recovery message if we haven't sent one recently
+                if now - user_data.get('last_recovery_sent', 0) > 1800:  # 30 minutes
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"{EMOJI['clock']} *Are you still there?*\n\n"
+                            f"I noticed that our conversation has been inactive for a while. "
+                            f"If you were in the middle of something and the bot stopped responding, "
+                            f"you can restart our conversation using the buttons below."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
+                            [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+                        ])
+                    )
+                    
+                    # Update the recovery sent time
+                    user_data['last_recovery_sent'] = now
+            except Exception as e:
+                loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
+
+# ---------------------------- Bot Recovery & Support Functions ----------------------------
 async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler for restarting the conversation when the user clicks the restart button.
@@ -5073,63 +4752,105 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
-async def check_conversation_status(context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Job to check if conversations have been idle for too long and offer recovery.
-    This runs periodically to check for stuck conversations.
+    Cancel the current conversation.
     
     Args:
-        context: Application context containing bot data
-    """
-    now = time.time()
-    bot = context.bot
-    
-    # Get all active conversations that might have stalled
-    for user_id, user_data in context.application.user_data.items():
-        # Check if this user has been inactive for more than 10 minutes
-        last_activity = user_data.get('last_activity_time', 0)
+        update: Telegram update
+        context: Conversation context
         
-        if last_activity and now - last_activity > 600:  # 10 minutes
-            # This user's conversation may be stalled
-            try:
-                # Only send recovery message if we haven't sent one recently
-                if now - user_data.get('last_recovery_sent', 0) > 1800:  # 30 minutes
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=(
-                            f"{EMOJI['clock']} *Are you still there?*\n\n"
-                            f"I noticed that our conversation has been inactive for a while. "
-                            f"If you were in the middle of something and the bot stopped responding, "
-                            f"you can restart our conversation using the buttons below."
-                        ),
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
-                            [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
-                        ])
-                    )
-                    
-                    # Update the recovery sent time
-                    user_data['last_recovery_sent'] = now
-            except Exception as e:
-                loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
-
-class ActivityTrackerMiddleware:
-    """Middleware to track user activity timestamps."""
+    Returns:
+        int: ConversationHandler.END
+    """
+    # Clear the user's cart
+    manage_cart(context, "clear")
     
-    async def on_pre_process_update(self, update: Update, data: dict):
-        """Record user activity time for every update."""
-        if update and update.effective_user:
-            user_id = update.effective_user.id
-            context = data.get('application_context')
-            
-            if context and hasattr(context, 'user_data'):
-                # Update the last activity time
-                context.user_data['last_activity_time'] = time.time()
+    # Log the cancellation
+    user = update.message.from_user
+    loggers["main"].info(f"User {user.id} cancelled their order")
+    
+    await update.message.reply_text(MESSAGES["cancel_order"])
+    return ConversationHandler.END
 
-class ConversationTimeout(Exception):
-    """Exception raised when a conversation times out."""
-    pass
+async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle conversation timeout.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        
+    Returns:
+        int: ConversationHandler.END
+    """
+    user = update.effective_user
+    
+    loggers["main"].info(f"Conversation timed out for user {user.id}")
+    
+    await context.bot.send_message(
+        chat_id=user.id,
+        text=ERRORS["timeout"]
+    )
+    return ConversationHandler.END
+
+async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command to check system health.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    user_id = update.message.from_user.id
+    
+    # Verify admin status
+    if user_id != ADMIN_ID:
+        await update.message.reply_text(ERRORS["not_authorized"])
+        return
+    
+    # Start health check
+    message = await update.message.reply_text(f"{EMOJI['info']} Performing system health check...")
+    
+    results = {
+        "database": True,
+        "google_sheets": True,
+        "google_drive": True,
+        "message_system": True
+    }
+    
+    try:
+        # Check Google Sheets connection
+        sheet, _ = await google_apis.initialize_sheets()
+        if not sheet:
+            results["google_sheets"] = False
+    except Exception as e:
+        results["google_sheets"] = False
+        loggers["errors"].error(f"Google Sheets health check failed: {e}")
+    
+    try:
+        # Check Google Drive connection
+        drive_service = await google_apis.get_drive_service()
+        if not drive_service:
+            results["google_drive"] = False
+    except Exception as e:
+        results["google_drive"] = False
+        loggers["errors"].error(f"Google Drive health check failed: {e}")
+    
+    # Format results
+    status_text = f"{EMOJI['search']} System Health Report:\n\n"
+    for system, status in results.items():
+        emoji = EMOJI["success"] if status else EMOJI["error"]
+        status_text += f"{emoji} {system.replace('_', ' ').title()}: {'Online' if status else 'Offline'}\n"
+    
+    # Add system stats
+    uptime = time.time() - context.bot_data.get("start_time", time.time())
+    hours, remainder = divmod(uptime, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    status_text += f"\n{EMOJI['time']} Uptime: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+    
+    await message.edit_text(status_text)
+
 # ---------------------------- Convenience Functions ----------------------------
 # These wrapper functions make it easier to pass our dependencies to handlers
 async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5165,39 +4886,6 @@ async def handle_payment_screenshot_wrapper(update: Update, context: ContextType
 async def handle_order_tracking_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await handle_order_tracking(update, context, order_manager, loggers)
 
-async def admin_panel_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await admin_panel(update, context, ADMIN_ID, loggers)
-
-async def view_orders_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await view_orders(update, context, google_apis, loggers)
-
-async def filter_orders_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await filter_orders(update, context, google_apis, loggers)
-
-async def manage_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await manage_order(update, context, google_apis, loggers)
-
-async def view_payment_screenshot_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await view_payment_screenshot(update, context, google_apis, loggers)
-
-async def update_order_status_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await update_order_status(update, context, loggers)
-
-async def set_order_status_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await set_order_status(update, context, order_manager, loggers)
-
-async def add_tracking_link_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await add_tracking_link(update, context)
-
-async def receive_tracking_link_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await receive_tracking_link(update, context, order_manager, loggers)
-
-async def skip_tracking_link_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await skip_tracking_link(update, context, order_manager, loggers)
-
-async def back_to_admin_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await back_to_admin(update, context)
-
 async def handle_quantity_selection_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await handle_quantity_selection(update, context, inventory_manager, loggers)
 
@@ -5207,67 +4895,10 @@ async def handle_back_navigation_wrapper(update: Update, context: ContextTypes.D
 async def back_to_categories_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await back_to_categories(update, context, inventory_manager, loggers)
 
-async def back_to_categories_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await back_to_categories(update, context, inventory_manager, loggers)
-
-async def search_order_prompt_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await search_order_prompt(update, context)
-
-async def handle_admin_search_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await handle_admin_search(update, context, google_apis, loggers)
-
-async def review_payments_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await review_payments(update, context, google_apis, loggers)
-
-async def review_specific_payment_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await review_specific_payment(update, context, google_apis, loggers, order_manager)
-
-async def process_payment_action_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await process_payment_action(update, context, order_manager, loggers)
-
-async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Wrapper for the track_order function that handles the initial /track command."""
-    user_id = update.effective_user.id
-    
-    # Clear any previous tracking data
-    if 'track_order_id' in context.user_data:
-        del context.user_data['track_order_id']
-    
-    # Log the tracking request
-    logging.info(f"User {user_id} initiated order tracking")
-    
-    # Always prompt the user to enter their order ID
-    prompt_message = (
-        f"{EMOJI['package']} <b>Track Your Order</b>\n\n"
-        f"Please enter your order ID to track its status.\n"
-        f"Your order ID can be found in your order confirmation message."
-    )
-    
-    # If user has previous orders, offer a button to show recent orders
-    user_orders = get_user_orders(user_id)
-    
-    # Create a keyboard with additional options
-    keyboard = []
-    
-    # Add recent orders button if the user has previous orders
-    if user_orders and len(user_orders) > 0:
-        keyboard.append([InlineKeyboardButton("📋 Show My Recent Orders", callback_data="show_recent_orders")])
-    
-    # Always add cancel button
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")])
-    
-    await update.message.reply_text(
-        prompt_message,
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-        parse_mode=ParseMode.HTML
-    )
-    
-    # Return the state for conversation handler
-    return TRACK_ORDER
 # ---------------------------- Bot Setup ----------------------------
 def main():
     """Set up the bot and start polling."""
-    global loggers, google_apis, inventory_manager, order_manager
+    global loggers, google_apis, inventory_manager, order_manager, admin_panel
     
     # Set up logging
     loggers = setup_logging()
@@ -5292,48 +4923,45 @@ def main():
     google_apis = GoogleAPIsManager(loggers)
     inventory_manager = InventoryManager(google_apis, loggers)
     order_manager = OrderManager(google_apis, loggers)
-
-    # Set up the application with persistence
-    persistence = PicklePersistence(filepath="bot_data.pickle")
-    application = Application.builder().token(TOKEN).persistence(persistence).build()
+    admin_panel = AdminPanel(app.bot, ADMIN_ID, google_apis, order_manager, loggers)
     
     # Add health check and activity tracking middleware
-    application.add_handler(
-        TypeHandler(Update, lambda update, context: HealthCheckMiddleware(application.bot, ADMIN_ID, loggers).on_pre_process_update(update, context)),
+    app.add_handler(
+        TypeHandler(Update, lambda update, context: HealthCheckMiddleware(app.bot, [ADMIN_ID], loggers).on_pre_process_update(update, context)),
         group=-3
     )
-    application.add_handler(
+    app.add_handler(
         TypeHandler(Update, lambda update, context: ActivityTrackerMiddleware().on_pre_process_update(update, context)), 
         group=-2
     )
     
     # Set up enhanced error handler
-    application.add_error_handler(enhanced_error_handler)
+    app.add_error_handler(enhanced_error_handler)
     
     # Add recovery command handlers
-    application.add_handler(CommandHandler("reset", reset_command))
-    application.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
-    application.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
+    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
+    app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
     app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
     app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
     app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
     app.add_handler(CommandHandler("support", support_command))
     
     # Schedule periodic checks for stuck conversations
-    job_queue = application.job_queue
+    job_queue = app.job_queue
     job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
 
     # Admin search conversation handler
     admin_search_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(search_order_prompt_wrapper, pattern="^search_order$")],
+        entry_points=[CallbackQueryHandler(admin_panel.search_order_prompt, pattern="^search_order$")],
         states={
             ADMIN_SEARCH: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_search_wrapper)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.handle_admin_search)
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(back_to_admin_wrapper, pattern="^back_to_admin$")
+            CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$")
         ],
         name="admin_search_conversation",
         persistent=True,
@@ -5342,47 +4970,47 @@ def main():
     
     # Set up conversation handler for main ordering flow
     conversation_handler = ConversationHandler(
-    entry_points=[CommandHandler("start", start_wrapper)],
-    states={
-        CATEGORY: [
-            CallbackQueryHandler(choose_category_wrapper)
+        entry_points=[CommandHandler("start", start_wrapper)],
+        states={
+            CATEGORY: [
+                CallbackQueryHandler(choose_category_wrapper)
+            ],
+            STRAIN_TYPE: [
+                CallbackQueryHandler(choose_strain_type_wrapper)
+            ],
+            BROWSE_BY: [
+                CallbackQueryHandler(browse_carts_by_wrapper)
+            ],
+            PRODUCT_SELECTION: [
+                CallbackQueryHandler(select_product_wrapper)
+            ],
+            QUANTITY: [
+                CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_"),
+                CallbackQueryHandler(handle_quantity_selection_wrapper, pattern="^qty_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_quantity_wrapper)
+            ],
+            CONFIRM: [
+                CallbackQueryHandler(confirm_order_wrapper)
+            ],
+            DETAILS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_details_wrapper)
+            ],
+            CONFIRM_DETAILS: [
+                CallbackQueryHandler(confirm_details_wrapper)
+            ],
+            PAYMENT: [
+                MessageHandler(filters.PHOTO, handle_payment_screenshot_wrapper),
+                CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_")
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("categories", back_to_categories_wrapper),
         ],
-        STRAIN_TYPE: [
-            CallbackQueryHandler(choose_strain_type_wrapper)
-        ],
-        BROWSE_BY: [
-            CallbackQueryHandler(browse_carts_by_wrapper)
-        ],
-        PRODUCT_SELECTION: [
-            CallbackQueryHandler(select_product_wrapper)
-        ],
-        QUANTITY: [
-            CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_"),
-            CallbackQueryHandler(handle_quantity_selection_wrapper, pattern="^qty_"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, input_quantity_wrapper)
-        ],
-        CONFIRM: [
-            CallbackQueryHandler(confirm_order_wrapper)
-        ],
-        DETAILS: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, input_details_wrapper)
-        ],
-        CONFIRM_DETAILS: [
-            CallbackQueryHandler(confirm_details_wrapper)
-        ],
-        PAYMENT: [
-            MessageHandler(filters.PHOTO, handle_payment_screenshot_wrapper),
-            CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_")
-        ]
-    },
-    fallbacks=[
-        CommandHandler("cancel", cancel),
-        CommandHandler("categories", back_to_categories_wrapper),
-    ],
-    name="ordering_conversation",
-    persistent=True,
-    conversation_timeout=900  # 15 minutes timeout
-)
+        name="ordering_conversation",
+        persistent=True,
+        conversation_timeout=900  # 15 minutes timeout
+    )
     
     # Order tracking conversation handler
     tracking_handler = ConversationHandler(
@@ -5405,20 +5033,14 @@ def main():
         conversation_timeout=300  # 5 minutes timeout
     )
 
-    # Register the tracking handler
-    app.add_handler(tracking_handler)
-
-    # Register callback handlers
-    app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
-
     # Admin tracking link input handler
     admin_tracking_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_")],
+        entry_points=[CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_")],
         states={
-            ADMIN_TRACKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tracking_link_wrapper)]
+            ADMIN_TRACKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.receive_tracking_link)]
         },
         fallbacks=[
-            CallbackQueryHandler(skip_tracking_link_wrapper, pattern="^skip_tracking_link$"),
+            CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"),
             CommandHandler("cancel", cancel)
         ],
         name="admin_tracking_conversation",
@@ -5426,30 +5048,26 @@ def main():
         conversation_timeout=300  # 5 minutes timeout
     )
     
-    # Admin command handler
-    app.add_handler(CommandHandler("admin", admin_panel_wrapper))
+    # Admin command handler - route to the admin panel class
+    app.add_handler(CommandHandler("admin", lambda update, context: admin_panel.show_panel(update, context)))
     app.add_handler(CommandHandler("health", health_check))
     
     # Admin panel callback handlers
-    app.add_handler(CallbackQueryHandler(back_to_admin_wrapper, pattern="^back_to_admin$"))
-    app.add_handler(CallbackQueryHandler(view_orders_wrapper, pattern="^view_orders$"))
-    app.add_handler(CallbackQueryHandler(filter_orders_wrapper, pattern="^filter_"))
-    app.add_handler(CallbackQueryHandler(manage_order_wrapper, pattern="^manage_order_"))
-    app.add_handler(CallbackQueryHandler(update_order_status_wrapper, pattern="^update_status_"))
-    app.add_handler(CallbackQueryHandler(view_payment_screenshot_wrapper, pattern="^view_payment_"))
-    app.add_handler(CallbackQueryHandler(set_order_status_wrapper, pattern="^set_status_"))
-    app.add_handler(CallbackQueryHandler(skip_tracking_link_wrapper, pattern="^skip_tracking_link$"))
-    app.add_handler(CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_link$"))
+    app.add_handler(CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$"))
+    app.add_handler(CallbackQueryHandler(admin_panel.view_orders, pattern="^view_orders$"))
+    app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.view_orders(update, context), pattern="^filter_"))
+    app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.manage_order(update, context), pattern="^manage_order_"))
+    app.add_handler(CallbackQueryHandler(admin_panel.update_order_status, pattern="^update_status_"))
+    app.add_handler(CallbackQueryHandler(admin_panel.view_payment_screenshot, pattern="^view_payment_"))
+    app.add_handler(CallbackQueryHandler(admin_panel.set_order_status, pattern="^set_status_"))
+    app.add_handler(CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"))
+    app.add_handler(CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_link$"))
     app.add_handler(admin_search_handler)
-    app.add_handler(CallbackQueryHandler(review_payments_wrapper, pattern="^approve_payments$"))
-    app.add_handler(CallbackQueryHandler(review_specific_payment_wrapper, pattern="^review_payment_"))
-    app.add_handler(CallbackQueryHandler(process_payment_action_wrapper, pattern="^approve_payment_|^reject_payment_"))
+    app.add_handler(CallbackQueryHandler(admin_panel.review_payments, pattern="^approve_payments$"))
+    app.add_handler(CallbackQueryHandler(admin_panel.review_specific_payment, pattern="^review_payment_"))
+    app.add_handler(CallbackQueryHandler(admin_panel.process_payment_action, pattern="^approve_payment_|^reject_payment_"))
     
-    # Tracking conversation handlers
-    app.add_handler(CallbackQueryHandler(track_order_wrapper, pattern="^track_order$"))
-    app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
-
-    # Add the main conversation handlers
+    # Register the main handlers
     app.add_error_handler(error_handler)
     app.add_handler(admin_tracking_handler)
     app.add_handler(tracking_handler)
