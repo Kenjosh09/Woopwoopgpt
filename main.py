@@ -55,7 +55,7 @@ SUPPORT_ADMIN_ID = os.getenv("SUPPORT_ADMIN_ID", "123456789")
 SUPPORT_ADMIN_USERNAME = os.getenv("SUPPORT_ADMIN_USERNAME", "your_support_username")
 
 # Get configuration from environment variables
-TOKEN = os.getenv("7870716772:AAGsV84i-MLpHS7X-rT5k6dl767mhi7sNME")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     print("Error: TELEGRAM_BOT_TOKEN environment variable not set")
     logging.error("TELEGRAM_BOT_TOKEN environment variable not set")
@@ -63,6 +63,7 @@ if not TOKEN:
     
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "5167750837"))
 GCASH_NUMBER = os.getenv("GCASH_NUMBER", "09171234567")
+GCASH_QR_CODE_URL = os.getenv("GCASH_QR_CODE_URL", "https://example.com/gcash_qr.jpg")
 
 # Google API configuration
 GOOGLE_SHEET_NAME = "Telegram Orders"
@@ -91,6 +92,7 @@ EMOJI = {
     "order": "📝",
     "deliver": "🚚",
     "tracking": "🔍",
+    "qrcode": "📱",
     
     # User interaction emojis
     "welcome": "👋",
@@ -220,11 +222,13 @@ MESSAGES = {
     ),
     
     "payment_instructions": (
-        f"{EMOJI['payment']} Please send a screenshot of your payment to complete the order.\n\n"
-        f"{EMOJI['money']} Send payment to GCash: {{}}\n\n"
-        f"{EMOJI['info']} Note: If you're using the desktop app of Telegram, please select "
-        "the option to compress the image when uploading or pasting your payment screenshot.\n\n"
-        f"{EMOJI['success']} We will review your payment and proceed with processing your order."
+    f"{EMOJI['payment']} Please send a screenshot of your payment to complete the order.\n\n"
+    f"{EMOJI['money']} Send payment to GCash: {{}}\n\n"
+    f"{EMOJI['qrcode']} Scan this QR code for faster payment:\n"
+    f"[QR Code will appear here]\n\n"
+    f"{EMOJI['info']}<b>Note: If you're using the desktop app of Telegram, please select "
+    "the option to compress the image when uploading or pasting your payment screenshot.</b>\n\n"
+    f"{EMOJI['success']} We will review your payment and proceed with processing your order."
     ),
     
     "order_confirmation": (
@@ -2716,6 +2720,7 @@ async def input_details(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
     
     return CONFIRM_DETAILS
 
+# Update the confirm_details function (around line 2771-2774)
 async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, loggers, admin_id):
     """
     Handle shipping details confirmation.
@@ -2766,10 +2771,23 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
         # Send summary to admin
         await context.bot.send_message(admin_id, summary)
         
-        # Prompt user for payment
+        # First send payment text
         await query.edit_message_text(
             MESSAGES["payment_instructions"].format(GCASH_NUMBER)
         )
+        
+        # Then send the QR code
+        try:
+            # Only send if a QR code URL is configured
+            if GCASH_QR_CODE_URL and GCASH_QR_CODE_URL != "https://example.com/gcash_qr.jpg":
+                await context.bot.send_photo(
+                    chat_id=query.from_user.id,
+                    photo=GCASH_QR_CODE_URL,
+                    caption=f"{EMOJI['qrcode']} GCash QR Code for {GCASH_NUMBER}\nScan this code to pay directly."
+                )
+        except Exception as e:
+            # Log the error but continue with the flow
+            loggers["errors"].error(f"Failed to send QR code: {e}")
         
         return PAYMENT
     elif query.data == 'edit_details':
@@ -3312,19 +3330,19 @@ async def handle_order_tracking(
 class AdminPanel:
     """Handles all admin panel functionality."""
     
-    def __init__(self, bot, admin_id, google_apis, order_manager, loggers):
+    def __init__(self, bot, admin_ids, google_apis, order_manager, loggers):
         """
         Initialize the Admin Panel.
         
         Args:
             bot: The Telegram bot instance
-            admin_id: Telegram ID of the admin user
+            admin_ids: List of Telegram IDs of admin users
             google_apis: GoogleAPIsManager instance
             order_manager: OrderManager instance
             loggers: Dictionary of logger instances
         """
         self.bot = bot
-        self.admin_id = admin_id
+        self.admin_ids = admin_ids if isinstance(admin_ids, list) else [admin_ids]
         self.google_apis = google_apis
         self.order_manager = order_manager
         self.loggers = loggers
@@ -3332,13 +3350,13 @@ class AdminPanel:
     async def show_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Display the admin panel main menu."""
         user = update.message.from_user
-        
+    
         # Check if user is authorized
-        if user.id != self.admin_id:
+        if user.id not in self.admin_ids:
             await update.message.reply_text(MESSAGES["not_authorized"])
             self.loggers["admin"].warning(f"Unauthorized admin panel access attempt by user {user.id}")
             return
-        
+    
         # Check rate limits
         if not check_rate_limit(context, user.id, "admin"):
             await update.message.reply_text(
@@ -3346,10 +3364,10 @@ class AdminPanel:
                 "Please try again later."
             )
             return
-        
+    
         # Log the admin panel access
         self.loggers["admin"].info(f"Admin {user.id} accessed admin panel")
-        
+    
         # Send welcome message with options
         await update.message.reply_text(
             MESSAGES["admin_welcome"],
@@ -3772,6 +3790,42 @@ class AdminPanel:
                 ])
             )
     
+    async def command_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle unrecognized commands with a helpful response.
+    
+        Args:
+            update: Telegram update
+            context: Conversation context
+        """
+        command = update.message.text
+        user_id = update.effective_user.id
+    
+        # Log the unrecognized command
+        loggers["main"].info(f"User {user_id} entered unrecognized command: {command}")
+    
+        # Create a helpful message with available commands
+        available_commands = (
+            f"{EMOJI['info']} **Available Commands:**\n\n"
+            f"• /start - Start ordering\n"
+            f"• /track - Track your order\n"
+            f"• /categories - Browse categories\n"
+            f"• /reset - Reset the conversation\n"
+            f"• /help - Show this help message\n"
+            f"• /support - Contact support\n\n"
+            f"{EMOJI['question']} Need assistance? Use /support to get help."
+        )
+    
+        # Send a friendly message with command suggestions
+        await update.message.reply_text(
+            f"{EMOJI['question']} I don't recognize the command '{command}'.\n\n{available_commands}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['browse']} Start Shopping", callback_data="start_shopping")],
+                [InlineKeyboardButton(f"{EMOJI['tracking']} Track Order", callback_data="track_order")]
+            ])
+        )
+
     async def add_tracking_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Handle adding or updating tracking link.
@@ -4378,6 +4432,10 @@ async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_T
     """
     Enhanced error handler for catching and logging errors, and notifying users.
     
+    This function handles errors that occur during bot operation, providing
+    appropriate user feedback and logging for administrators. It prevents
+    duplicate error messages and implements special handling for common errors.
+    
     Args:
         update: Telegram update that caused the error
         context: Context with error details
@@ -4400,9 +4458,37 @@ async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         loggers["errors"].error(f"Error retrieving user/chat information: {e}")
     
+    # Check if this error was already processed (prevents duplicate notifications)
+    error_key = f"{chat_id}:{message_id}" if chat_id and message_id else str(error)
+    
+    # Initialize processed_errors set if it doesn't exist
+    if not hasattr(context.bot_data, "processed_errors"):
+        context.bot_data["processed_errors"] = set()
+    
+    # Skip if already processed this error
+    if error_key in context.bot_data["processed_errors"]:
+        return
+    
+    # Mark this error as processed
+    context.bot_data["processed_errors"].add(error_key)
+    
+    # Clean up processed errors periodically (keep only recent ones)
+    if len(context.bot_data["processed_errors"]) > 100:
+        # Remove oldest items to keep set size manageable
+        try:
+            for _ in range(50):  # Remove 50 oldest items
+                context.bot_data["processed_errors"].pop()
+        except KeyError:
+            # Set might be empty, just ignore
+            pass
+    
     # Log the error details
     error_text = f"User: {user_id} | Chat: {chat_id} | Error: {type(error).__name__}: {error}"
     loggers["errors"].error(f"Error in enhanced_error_handler | {error_text}")
+    
+    # Skip known command errors - these will be handled by command_not_found
+    if isinstance(error, TelegramError) and "Command not found" in str(error):
+        return
     
     # Generate a unique error reference code
     error_ref = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
@@ -4794,6 +4880,51 @@ async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Display a help message with available commands and usage instructions.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    help_message = (
+        f"{EMOJI['help']} *GanJa Paraiso Bot Help*\n\n"
+        f"*Available Commands:*\n"
+        f"• /start - Start shopping or return to main menu\n"
+        f"• /track - Track your order status\n"
+        f"• /help - Show this help message\n"
+        f"• /reset - Reset your conversation\n"
+        f"• /support - Contact customer support\n\n"
+        
+        f"*How to Order:*\n"
+        f"1. Use /start to begin ordering\n"
+        f"2. Select a product category\n"
+        f"3. Choose a specific product\n"
+        f"4. Enter quantity\n"
+        f"5. Add to cart or proceed to checkout\n"
+        f"6. Enter shipping details\n"
+        f"7. Send GCash payment screenshot\n\n"
+        
+        f"*Tracking Your Order:*\n"
+        f"Use /track and enter your order ID\n\n"
+        
+        f"*Need Help?*\n"
+        f"If you have questions or encounter issues, use the /support command to contact our customer service team."
+    )
+    
+    # Create button options
+    keyboard = [
+        [InlineKeyboardButton(f"{EMOJI['browse']} Start Shopping", callback_data="start_shopping")],
+        [InlineKeyboardButton(f"{EMOJI['tracking']} Track Order", callback_data="track_order")],
+        [InlineKeyboardButton(f"{EMOJI['support']} Contact Support", callback_data="contact_support")]
+    ]
+    
+    await update.message.reply_text(
+        help_message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
 async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin command to check system health.
@@ -4910,6 +5041,17 @@ def main():
         print("Error: No bot token found. Please set the TELEGRAM_BOT_TOKEN environment variable.")
         sys.exit(1)
 
+    # Support multiple admin IDs
+    # Get admin IDs from environment variable - expect comma-separated list
+    admin_ids_str = os.getenv("ADMIN_TELEGRAM_IDS", str(ADMIN_ID))
+    admin_ids = [int(id.strip()) for id in admin_ids_str.split(",") if id.strip().isdigit()]
+    
+    # Ensure at least the primary admin ID is included
+    if ADMIN_ID not in admin_ids:
+        admin_ids.append(ADMIN_ID)
+    
+    loggers["main"].info(f"Configured admin IDs: {admin_ids}")
+
     # Create persistence object to save conversation states
     persistence = PicklePersistence(filepath="bot_persistence")
     
@@ -4923,7 +5065,8 @@ def main():
     google_apis = GoogleAPIsManager(loggers)
     inventory_manager = InventoryManager(google_apis, loggers)
     order_manager = OrderManager(google_apis, loggers)
-    admin_panel = AdminPanel(app.bot, ADMIN_ID, google_apis, order_manager, loggers)
+    # Create admin panel with multiple admin IDs
+    admin_panel = AdminPanel(app.bot, admin_ids, google_apis, order_manager, loggers)
     
     # Add health check and activity tracking middleware
     app.add_handler(
@@ -4946,6 +5089,7 @@ def main():
     app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
     app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
     app.add_handler(CommandHandler("support", support_command))
+    app.add_handler(CommandHandler("help", help_command))
     
     # Schedule periodic checks for stuck conversations
     job_queue = app.job_queue
@@ -5074,6 +5218,13 @@ def main():
     app.add_handler(conversation_handler)
     app.add_handler(CommandHandler("categories", back_to_categories_wrapper))
     
+    # Register handler for unknown commands - must be added AFTER all other command handlers
+    unknown_command_handler = MessageHandler(
+        filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE, 
+        command_not_found
+    )
+    app.add_handler(unknown_command_handler)
+
     # Log the startup
     loggers["main"].info("Bot is running...")
     print("Bot is running...")
