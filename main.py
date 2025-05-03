@@ -57,6 +57,10 @@ ADMIN_SEARCH, ADMIN_TRACKING = 10, 11
 # Define conversation states
 TRACK_ORDER = 1
 
+# Support admin user ID (the Telegram user ID that will receive support requests)
+SUPPORT_ADMIN_ID = "123456789"  # Replace with the actual Telegram user ID of your support admin
+SUPPORT_ADMIN_USERNAME = "your_support_username"  # Replace with the actual username (without @)
+
 # Get configuration from environment variables or use defaults
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7870716772:AAFn8Gjay6Ok6a3YeqU1WIZdmixQbMCHfiI")
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "5167750837"))
@@ -156,7 +160,7 @@ PRODUCTS = {
         "emoji": EMOJI["buds"],
         "description": "High-quality cannabis flowers",
         "min_order": 1,
-        "unit": "gram/s",
+        "unit": "grams",
         "tag": "buds",
         "requires_strain_selection": True
     },
@@ -165,7 +169,7 @@ PRODUCTS = {
         "emoji": EMOJI["local"],
         "description": "Local budget-friendly option",
         "min_order": 10,
-        "unit": "gram/s",
+        "unit": "grams",
         "tag": "local",
         "price_per_unit": 1000
     },
@@ -174,7 +178,7 @@ PRODUCTS = {
         "emoji": EMOJI["carts"],
         "description": "Pre-filled vape cartridges",
         "min_order": 1,
-        "unit": "unit/s",
+        "unit": "units",
         "tag": "carts",
         "browse_options": ["brand", "weight"]
     },
@@ -183,7 +187,7 @@ PRODUCTS = {
         "emoji": EMOJI["edibles"],
         "description": "Cannabis-infused food products",
         "min_order": 1,
-        "unit": "pack/s",
+        "unit": "packs",
         "tag": "edibs",
         "requires_strain_selection": True
     }
@@ -1015,6 +1019,30 @@ class GoogleAPIsManager:
         self.last_request_time[api_name] = time.time()
 
 # ---------------------------- Utility Functions ----------------------------
+def is_valid_order_id(order_id):
+    """Validate the format of an order ID."""
+    # Implement your validation logic here
+    # For example, checking if it's a valid pattern like "ORD-12345"
+    return bool(order_id and len(order_id) >= 3)  # Simple example
+
+def get_user_orders(user_id):
+    """Get a list of orders for a specific user."""
+    # Implement your logic to retrieve orders from database
+    # Return a list of order dictionaries sorted by date (newest first)
+    # Each order should have 'order_id', 'date', 'total', etc.
+    return []  # Replace with actual implementation
+
+def get_support_deep_link(user_id, order_id):
+    """Create a deep link for support chat with prepared message."""
+    import urllib.parse
+    
+    message = f"Hi Support, I need help with my order. My user ID is {user_id} and my order ID is {order_id}."
+    encoded_message = urllib.parse.quote(message)
+    
+    deep_link = f"https://t.me/{SUPPORT_ADMIN_USERNAME}?start&text={encoded_message}"
+    
+    return deep_link
+
 def build_category_buttons(available_categories):
     """
     Build inline keyboard with available product category buttons.
@@ -1648,7 +1676,7 @@ class OrderManager:
             product = item.get("suboption", "Unknown")
             category = item.get("category", "Unknown")
             quantity = item.get("quantity", 0)
-            unit = item.get("unit", "grams")
+            unit = item.get("unit", "gram/s")
             item_price = item.get("total_price", 0)
             
             # Add each item with bullet points
@@ -2875,6 +2903,154 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
         return DETAILS
     
 # ---------------------------- Payment & Tracking Handlers ----------------------------
+async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper for the track_order function that handles the initial /track command."""
+    user_id = update.effective_user.id
+    
+    # Clear any previous tracking data
+    if 'track_order_id' in context.user_data:
+        del context.user_data['track_order_id']
+    
+    # Log the tracking request
+    logging.info(f"User {user_id} initiated order tracking")
+    
+    # Always prompt the user to enter their order ID
+    prompt_message = (
+        f"{EMOJI['package']} <b>Track Your Order</b>\n\n"
+        f"Please enter your order ID to track its status.\n"
+        f"Your order ID can be found in your order confirmation message."
+    )
+    
+    # If user has previous orders, offer a button to show recent orders
+    user_orders = get_user_orders(user_id)
+    
+    # Create a keyboard with additional options
+    keyboard = []
+    
+    # Add recent orders button if the user has previous orders
+    if user_orders and len(user_orders) > 0:
+        keyboard.append([InlineKeyboardButton("📋 Show My Recent Orders", callback_data="show_recent_orders")])
+    
+    # Always add cancel button
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")])
+    
+    await update.message.reply_text(
+        prompt_message,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+        parse_mode=ParseMode.HTML
+    )
+    
+    # Return the state for conversation handler
+    return TRACK_ORDER
+
+async def show_recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a list of the user's recent orders to select from."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_orders = get_user_orders(user_id)
+    
+    if not user_orders or len(user_orders) == 0:
+        await query.edit_message_text(
+            f"{EMOJI['error']} <b>No Recent Orders</b>\n\n"
+            f"You don't have any recent orders to display.\n"
+            f"Please enter an order ID manually.",
+            parse_mode=ParseMode.HTML
+        )
+        return TRACK_ORDER
+    
+    # Create a message showing recent orders with buttons to select
+    message = f"{EMOJI['list']} <b>Your Recent Orders</b>\n\n"
+    
+    # Create keyboard with buttons for each order
+    keyboard = []
+    
+    # Add up to 5 most recent orders
+    for i, order in enumerate(user_orders[:5]):
+        order_id = order.get('order_id')
+        order_date = order.get('date', 'Unknown date')
+        order_total = order.get('total', 'Unknown amount')
+        
+        # Add to message
+        message += f"{i+1}. Order #{order_id} - {order_date} - {order_total}\n"
+        
+        # Add button to select this order
+        keyboard.append([InlineKeyboardButton(
+            f"📦 Order #{order_id}",
+            callback_data=f"select_order_{order_id}"
+        )])
+    
+    # Add a button to enter order ID manually
+    keyboard.append([InlineKeyboardButton("🔢 Enter Different Order ID", callback_data="enter_order_id")])
+    
+    # Add cancel button
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")])
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    
+    return TRACK_ORDER
+
+async def select_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle when a user selects an order from their recent orders list."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract the order_id from the callback data
+    # Format is "select_order_XXXX" where XXXX is the order ID
+    callback_data = query.data
+    order_id = callback_data.replace("select_order_", "")
+    
+    # Store the order ID in user data
+    context.user_data['track_order_id'] = order_id
+    
+    # Process the selected order
+    return await track_order(update, context)
+
+async def enter_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt the user to enter an order ID manually."""
+    query = update.callback_query
+    await query.answer()
+    
+    prompt_message = (
+        f"{EMOJI['id']} <b>Enter Order ID</b>\n\n"
+        f"Please type your order ID below.\n"
+        f"Your order ID can be found in your order confirmation message."
+    )
+    
+    # Add cancel button
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")]]
+    
+    await query.edit_message_text(
+        prompt_message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    
+    return TRACK_ORDER
+
+async def cancel_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the order tracking process."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Clear tracking data
+    if 'track_order_id' in context.user_data:
+        del context.user_data['track_order_id']
+    
+    await query.edit_message_text(
+        f"{EMOJI['cancel']} <b>Tracking Canceled</b>\n\n"
+        f"You've canceled the order tracking process.\n"
+        f"You can start again with the /track command anytime.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    return ConversationHandler.END
+
 async def handle_payment_screenshot(
     update: Update, context: ContextTypes.DEFAULT_TYPE, 
     google_apis, order_manager, loggers
@@ -3064,7 +3240,7 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create the tracking message
     message = (
-        f"{EMOJI['package']} *Order Status Update*\n\n"
+        f"{EMOJI['package']} <b>Order Status Update</b>\n\n"
         f"{EMOJI['id']} Order ID: {order_id}\n"
         f"{EMOJI['date']} Ordered on: {order_date}\n"
         f"{EMOJI['status']} Status: {status}\n"
@@ -3074,7 +3250,7 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Add tracking link if available
     if tracking_link:
-        message += f"\n{EMOJI['link']} *Track your delivery:* {tracking_link}\n"
+        message += f"\n{EMOJI['link']} <b>Track your delivery:</b> {tracking_link}\n"
     
     # Add contextual hints based on status
     status_lower = status.lower()
@@ -3113,7 +3289,7 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         message,
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard),
         disable_web_page_preview=True
     )
@@ -3121,33 +3297,41 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def get_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler for getting the order ID from user input.
-    
-    Args:
-        update: Telegram update object
-        context: Context object
-        
-    Returns:
-        int: Next conversation state
-    """
-    # Get the order ID from the message
+    """Handle the order ID input from the user."""
+    user_id = update.effective_user.id
     order_id = update.message.text.strip()
     
-    # Validate the order ID format (basic validation)
-    if not order_id or len(order_id) < 5:
+    # Validate the order ID format
+    if not is_valid_order_id(order_id):
         await update.message.reply_text(
-            f"{EMOJI['error']} Please enter a valid Order ID.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-            ])
+            f"{EMOJI['error']} <b>Invalid Order ID</b>\n\n"
+            f"The order ID you entered doesn't appear to be valid.\n"
+            f"Please check your order confirmation and try again.",
+            parse_mode=ParseMode.HTML
         )
         return TRACK_ORDER
     
-    # Store the order ID in context
+    # Store the order ID in user data
     context.user_data['track_order_id'] = order_id
     
-    # Call the track_order function to display order status
+    # Log the tracking request
+    logging.info(f"User {user_id} tracking order {order_id}")
+    
+    # Get order details
+    order_details = get_order_details(order_id)
+    if not order_details:
+        await update.message.reply_text(
+            f"{EMOJI['error']} <b>Order Not Found</b>\n\n"
+            f"We couldn't find any order with ID: {order_id}\n"
+            f"Please check the order ID and try again.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Try Again", callback_data="enter_order_id")
+            ]])
+        )
+        return TRACK_ORDER
+    
+    # Process the tracked order
     return await track_order(update, context)
 
 async def refresh_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4733,6 +4917,90 @@ async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ConversationHandler.END
 
+async def contact_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the contact support button click by directing users to PM a specific admin."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Get the user's data including their order ID if available
+    user_id = update.effective_user.id
+    order_id = context.user_data.get('track_order_id', 'Not specified')
+    
+    # Prepare deep linking URL to start a chat with the support admin
+    support_chat_url = f"https://t.me/{SUPPORT_ADMIN_USERNAME}"
+    
+    # Create the support message
+    support_message = (
+        f"{EMOJI['support']} <b>Need help with your order?</b>\n\n"
+        f"Please contact our support admin directly through Telegram:\n\n"
+        f"1️⃣ Click the button below to open a chat with our support admin\n"
+        f"2️⃣ Send them your order ID (or the subject of your concern): <code>{order_id}</code>\n"
+        f"3️⃣ Clearly describe your issue or question\n\n"
+        f"Our support team will respond as soon as possible!"
+    )
+    
+    # Create the keyboard with a button to open chat with support admin
+    keyboard = [
+        [InlineKeyboardButton("📱 Chat with Support", url=support_chat_url)],
+        [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data=f"refresh_tracking_{order_id}")]
+    ]
+    
+    # Log this support request
+    logging.info(f"User {user_id} requested support with the subject/order {order_id}")
+    
+    await query.edit_message_text(
+        support_message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    
+    # If you want to notify the admin about the support request (optional)
+    try:
+        admin_notification = (
+            f"🔔 <b>New Support Request</b>\n\n"
+            f"👤 User ID: <code>{user_id}</code>\n"
+            f"🧾 Subject/Order ID: <code>{order_id}</code>\n"
+            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await context.bot.send_message(
+            chat_id=SUPPORT_ADMIN_ID,
+            text=admin_notification,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        # Log the error but don't disrupt the user experience
+        logging.error(f"Failed to notify admin about support request: {e}")
+
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Direct support command handler."""
+    user_id = update.effective_user.id
+    order_id = context.user_data.get('track_order_id', 'Not specified')
+    
+    support_chat_url = get_support_deep_link(user_id, order_id)
+    
+    support_message = (
+        f"{EMOJI['support']} <b>Contact Our Support</b>\n\n"
+        f"For any questions or assistance with your orders, please contact our support admin directly:\n\n"
+        f"• Click the button below to open a chat\n"
+        f"• Your user ID: <code>{user_id}</code>\n"
+        f"• Latest order ID (if any): <code>{order_id}</code>\n\n"
+        f"We're here to help you have the best experience!"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("📱 Chat with Support", url=support_chat_url)],
+        [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+    ]
+    
+    logging.info(f"User {user_id} accessed support command")
+    
+    await update.message.reply_text(
+        support_message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
 async def get_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler for providing help when the user clicks the help button.
@@ -4894,9 +5162,6 @@ async def confirm_details_wrapper(update: Update, context: ContextTypes.DEFAULT_
 async def handle_payment_screenshot_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await handle_payment_screenshot(update, context, google_apis, order_manager, loggers)
 
-async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await track_order(update, context, loggers)
-
 async def handle_order_tracking_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await handle_order_tracking(update, context, order_manager, loggers)
 
@@ -4959,6 +5224,46 @@ async def review_specific_payment_wrapper(update: Update, context: ContextTypes.
 
 async def process_payment_action_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await process_payment_action(update, context, order_manager, loggers)
+
+async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper for the track_order function that handles the initial /track command."""
+    user_id = update.effective_user.id
+    
+    # Clear any previous tracking data
+    if 'track_order_id' in context.user_data:
+        del context.user_data['track_order_id']
+    
+    # Log the tracking request
+    logging.info(f"User {user_id} initiated order tracking")
+    
+    # Always prompt the user to enter their order ID
+    prompt_message = (
+        f"{EMOJI['package']} <b>Track Your Order</b>\n\n"
+        f"Please enter your order ID to track its status.\n"
+        f"Your order ID can be found in your order confirmation message."
+    )
+    
+    # If user has previous orders, offer a button to show recent orders
+    user_orders = get_user_orders(user_id)
+    
+    # Create a keyboard with additional options
+    keyboard = []
+    
+    # Add recent orders button if the user has previous orders
+    if user_orders and len(user_orders) > 0:
+        keyboard.append([InlineKeyboardButton("📋 Show My Recent Orders", callback_data="show_recent_orders")])
+    
+    # Always add cancel button
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")])
+    
+    await update.message.reply_text(
+        prompt_message,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+        parse_mode=ParseMode.HTML
+    )
+    
+    # Return the state for conversation handler
+    return TRACK_ORDER
 # ---------------------------- Bot Setup ----------------------------
 def main():
     """Set up the bot and start polling."""
@@ -5009,6 +5314,10 @@ def main():
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
     application.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
+    app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
+    app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
+    app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
+    app.add_handler(CommandHandler("support", support_command))
     
     # Schedule periodic checks for stuck conversations
     job_queue = application.job_queue
@@ -5079,14 +5388,29 @@ def main():
     tracking_handler = ConversationHandler(
         entry_points=[CommandHandler("track", track_order_wrapper)],
         states={
-            TRACKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_tracking_wrapper)]
+            TRACK_ORDER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, get_order_id),
+                CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"),
+                CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"),
+                CallbackQueryHandler(select_order, pattern="^select_order_"),
+                CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$")
+            ],
+            TRACKING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_tracking_wrapper)
+            ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         name="tracking_conversation",
         persistent=True,
         conversation_timeout=300  # 5 minutes timeout
     )
-    
+
+    # Register the tracking handler
+    app.add_handler(tracking_handler)
+
+    # Register callback handlers
+    app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
+
     # Admin tracking link input handler
     admin_tracking_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_")],
@@ -5121,6 +5445,10 @@ def main():
     app.add_handler(CallbackQueryHandler(review_specific_payment_wrapper, pattern="^review_payment_"))
     app.add_handler(CallbackQueryHandler(process_payment_action_wrapper, pattern="^approve_payment_|^reject_payment_"))
     
+    # Tracking conversation handlers
+    app.add_handler(CallbackQueryHandler(track_order_wrapper, pattern="^track_order$"))
+    app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
+
     # Add the main conversation handlers
     app.add_error_handler(error_handler)
     app.add_handler(admin_tracking_handler)
