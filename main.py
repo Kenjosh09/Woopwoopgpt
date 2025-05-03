@@ -46,8 +46,8 @@ load_dotenv()
 
 # ---------------------------- Constants & Configuration ----------------------------
 # States for the ConversationHandler
-CATEGORY, SUBOPTION, QUANTITY, CONFIRM, DETAILS, CONFIRM_DETAILS, PAYMENT, TRACKING = range(8)
-ADMIN_SEARCH, ADMIN_TRACKING = 8, 9
+CATEGORY, STRAIN_TYPE, BROWSE_BY, PRODUCT_SELECTION, QUANTITY, CONFIRM, DETAILS, CONFIRM_DETAILS, PAYMENT, TRACKING = range(10)
+ADMIN_SEARCH, ADMIN_TRACKING = 10, 11
 
 # Get configuration from environment variables or use defaults
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7870716772:AAFn8Gjay6Ok6a3YeqU1WIZdmixQbMCHfiI")
@@ -116,7 +116,8 @@ PRODUCTS = {
         "description": "High-quality cannabis flowers",
         "min_order": 1,
         "unit": "grams",
-        "types": ["indica", "sativa", "hybrid"]
+        "tag": "buds",
+        "requires_strain_selection": True
     },
     "local": {
         "name": "Local (BG)",
@@ -124,6 +125,7 @@ PRODUCTS = {
         "description": "Local budget-friendly option",
         "min_order": 10,
         "unit": "grams",
+        "tag": "local",
         "price_per_unit": 1000
     },
     "carts": {
@@ -132,21 +134,17 @@ PRODUCTS = {
         "description": "Pre-filled vape cartridges",
         "min_order": 1,
         "unit": "units",
-        "options": [
-            ("Brand A", "brand_a", 25),
-            ("Brand B", "brand_b", 30)
-        ]
+        "tag": "carts",
+        "browse_options": ["brand", "weight"]
     },
     "edibles": {
         "name": "Edibles",
         "emoji": EMOJI["edibles"],
         "description": "Cannabis-infused food products",
         "min_order": 1,
-        "unit": "pieces",
-        "options": [
-            ("Premium", "premium", 15),
-            ("Standard", "standard", 8)
-        ]
+        "unit": "packs",
+        "tag": "edibs",
+        "requires_strain_selection": True
     }
 }
 
@@ -314,7 +312,7 @@ SHEET_COLUMN_INDICES = {name: idx+1 for idx, name in enumerate(SHEET_HEADERS)}
 
 # ---------------------------- Regular Expressions ----------------------------
 REGEX = {
-    "shipping_details": r"^(?P<name>[\w\s]+)\s*/\s*(?P<address>[\w\s,]+)\s*/\s*(?P<contact>\+?\d{10,15})$",
+    "shipping_details": r"^(?P<n>[\w\s]+)\s*/\s*(?P<address>[\w\s,]+)\s*/\s*(?P<contact>\+?\d{10,15})$",
     "quantity": r"(\d+)"
 }
 
@@ -335,9 +333,12 @@ CACHE_EXPIRY = {
 
 # ---------------------------- Default Values ----------------------------
 DEFAULT_INVENTORY = [
-    {"Strain": "Unknown", "Type": "indica", "Price": 2000, "Stock": 5},
-    {"Strain": "Unknown", "Type": "sativa", "Price": 2000, "Stock": 5},
-    {"Strain": "Unknown", "Type": "hybrid", "Price": 2000, "Stock": 5}
+    {"Name": "Unknown Indica", "Type": "indica", "Tag": "buds", "Price": 2000, "Stock": 5},
+    {"Name": "Unknown Sativa", "Type": "sativa", "Tag": "buds", "Price": 2000, "Stock": 5},
+    {"Name": "Unknown Hybrid", "Type": "hybrid", "Tag": "buds", "Price": 2000, "Stock": 5},
+    {"Name": "Local BG", "Type": "", "Tag": "local", "Price": 1000, "Stock": 10},
+    {"Name": "Basic Cart", "Type": "", "Tag": "carts", "Brand": "Generic", "Weight": "1g", "Price": 1500, "Stock": 3},
+    {"Name": "Basic Edible", "Type": "hybrid", "Tag": "edibs", "Price": 500, "Stock": 5}
 ]
 
 # ---------------------------- Logging Setup ----------------------------
@@ -550,9 +551,12 @@ class GoogleAPIsManager:
             try:
                 self._inventory_sheet = spreadsheet.worksheet("Inventory")
             except:
-                self._inventory_sheet = spreadsheet.add_worksheet("Inventory", 100, 5)
-                # Initialize inventory headers
-                self._inventory_sheet.append_row(["Strain", "Type", "Price", "Stock"])
+                self._inventory_sheet = spreadsheet.add_worksheet("Inventory", 100, 10)
+                # Initialize inventory headers with new columns
+                self._inventory_sheet.append_row([
+                    "Name", "Strain", "Type", "Tag", "Price", "Stock", 
+                    "Weight", "Brand", "Description", "Image_URL"
+                ])
             
             # Ensure the orders sheet has the correct headers
             current_headers = self._sheet.row_values(1)
@@ -569,14 +573,15 @@ class GoogleAPIsManager:
     
     async def fetch_inventory(self):
         """
-        Fetch inventory data from Google Sheets.
+        Fetch inventory data from Google Sheets including tags and stock.
         Handles errors with graceful fallback to default inventory.
         
         Returns:
-            dict: Dictionary of strains organized by type
+            tuple: (products_by_tag, products_by_strain, all_products)
         """
-        strains = {'indica': [], 'sativa': [], 'hybrid': []}
-        prices = {}
+        products_by_tag = {'buds': [], 'local': [], 'carts': [], 'edibs': []}
+        products_by_strain = {'indica': [], 'sativa': [], 'hybrid': []}
+        all_products = []
         
         try:
             # Initialize sheets
@@ -586,11 +591,33 @@ class GoogleAPIsManager:
                 # Fallback to default inventory
                 self.loggers["errors"].warning("Using default inventory due to sheet access failure")
                 for item in DEFAULT_INVENTORY:
-                    strain_name = item['Strain']
-                    strain_key = strain_name.lower().replace(' ', '_')
-                    strains[item['Type'].lower()].append((strain_name, strain_key))
-                    prices[strain_key] = item['Price']
-                return strains, prices
+                    product_name = item.get('Name', item.get('Strain', 'Unknown'))
+                    product_key = product_name.lower().replace(' ', '_')
+                    product_tag = item.get('Tag', '').lower()
+                    strain_type = item.get('Type', '').lower()
+                    price = item.get('Price', 0)
+                    stock = item.get('Stock', 0)
+                    
+                    product = {
+                        'name': product_name,
+                        'key': product_key,
+                        'price': price,
+                        'stock': stock,
+                        'tag': product_tag,
+                        'strain': strain_type,
+                        'weight': item.get('Weight', ''),
+                        'brand': item.get('Brand', '')
+                    }
+                    
+                    all_products.append(product)
+                    
+                    if product_tag and product_tag in products_by_tag:
+                        products_by_tag[product_tag].append(product)
+                        
+                    if strain_type and strain_type in products_by_strain:
+                        products_by_strain[strain_type].append(product)
+                
+                return products_by_tag, products_by_strain, all_products
             
             # Make a rate-limited request
             await self._rate_limit_request('inventory')
@@ -599,30 +626,73 @@ class GoogleAPIsManager:
             inventory_data = inventory_sheet.get_all_records()
             
             for item in inventory_data:
-                if 'Stock' in item and item['Stock'] > 0:
-                    strain_name = item['Strain']
-                    strain_type = item.get('Type', '').lower()
+                # Skip items with no stock
+                if 'Stock' not in item or item['Stock'] <= 0:
+                    continue
                     
-                    # Skip items with missing data
-                    if not strain_name or not strain_type or strain_type not in strains:
-                        continue
-                        
-                    strain_key = strain_name.lower().replace(' ', '_')
-                    strains[strain_type].append((strain_name, strain_key))
-                    prices[strain_key] = item['Price']
+                product_name = item.get('Name', item.get('Strain', 'Unknown'))
+                product_key = product_name.lower().replace(' ', '_')
+                product_tag = item.get('Tag', '').lower()
+                strain_type = item.get('Type', '').lower()
+                price = item.get('Price', 0)
+                stock = item.get('Stock', 0)
+                
+                product = {
+                    'name': product_name,
+                    'key': product_key,
+                    'price': price,
+                    'stock': stock,
+                    'tag': product_tag,
+                    'strain': strain_type,
+                    'weight': item.get('Weight', ''),  # For carts
+                    'brand': item.get('Brand', '')     # For carts
+                }
+                
+                # Add to all products list
+                all_products.append(product)
+                
+                # Categorize by tag
+                if product_tag in products_by_tag:
+                    products_by_tag[product_tag].append(product)
+                    
+                # Categorize by strain
+                if strain_type in products_by_strain:
+                    products_by_strain[strain_type].append(product)
             
-            return strains, prices
+            return products_by_tag, products_by_strain, all_products
             
         except Exception as e:
             self.loggers["errors"].error(f"Error fetching inventory: {e}")
             # Fallback to default inventory
             self.loggers["errors"].warning("Using default inventory due to error")
             for item in DEFAULT_INVENTORY:
-                strain_name = item['Strain']
-                strain_key = strain_name.lower().replace(' ', '_')
-                strains[item['Type'].lower()].append((strain_name, strain_key))
-                prices[strain_key] = item['Price']
-            return strains, prices
+                product_name = item.get('Name', item.get('Strain', 'Unknown'))
+                product_key = product_name.lower().replace(' ', '_')
+                product_tag = item.get('Tag', '').lower()
+                strain_type = item.get('Type', '').lower()
+                price = item.get('Price', 0)
+                stock = item.get('Stock', 0)
+                
+                product = {
+                    'name': product_name,
+                    'key': product_key,
+                    'price': price,
+                    'stock': stock,
+                    'tag': product_tag,
+                    'strain': strain_type,
+                    'weight': item.get('Weight', ''),
+                    'brand': item.get('Brand', '')
+                }
+                
+                all_products.append(product)
+                
+                if product_tag and product_tag in products_by_tag:
+                    products_by_tag[product_tag].append(product)
+                    
+                if strain_type and strain_type in products_by_strain:
+                    products_by_strain[strain_type].append(product)
+            
+            return products_by_tag, products_by_strain, all_products
     
     async def upload_payment_screenshot(self, file_bytes, filename):
         """
@@ -828,18 +898,26 @@ class GoogleAPIsManager:
         self.last_request_time[api_name] = time.time()
 
 # ---------------------------- Utility Functions ----------------------------
-def build_category_buttons():
+def build_category_buttons(available_categories):
     """
-    Build inline keyboard with product category buttons.
+    Build inline keyboard with available product category buttons.
     
+    Args:
+        available_categories (list): List of available category IDs
+        
     Returns:
         InlineKeyboardMarkup: Keyboard with product category buttons
     """
     keyboard = []
     
-    for product_id, product in PRODUCTS.items():
-        button_text = f"{product['emoji']} {product['name']}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=product_id)])
+    for product_id in available_categories:
+        if product_id in PRODUCTS:
+            product = PRODUCTS[product_id]
+            button_text = f"{product['emoji']} {product['name']}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=product_id)])
+    
+    # Add cancel button
+    keyboard.append([InlineKeyboardButton(f"{EMOJI['error']} Cancel", callback_data="cancel")])
     
     return InlineKeyboardMarkup(keyboard)
 
@@ -1150,152 +1228,100 @@ async def retry_operation(operation, max_retries=3):
 
 # ---------------------------- Inventory Management ----------------------------
 class InventoryManager:
-    """Manages product inventory and caching."""
+    """Manages product inventory and caching with stock tracking."""
     
     def __init__(self, google_apis, loggers):
-        """
-        Initialize the inventory manager.
-        
-        Args:
-            google_apis: GoogleAPIsManager instance
-            loggers: Dictionary of logger instances
-        """
+        """Initialize the inventory manager."""
         self.google_apis = google_apis
         self.loggers = loggers
         self.cache = {
-            "strains": None,
-            "prices": None,
+            "products_by_tag": None,
+            "products_by_strain": None,
+            "all_products": None,
             "last_update": 0
         }
         
     async def get_inventory(self, force_refresh=False):
-        """
-        Get inventory data with caching.
-        
-        Args:
-            force_refresh (bool): Whether to bypass cache
-            
-        Returns:
-            tuple: (strains, prices)
-        """
+        """Get inventory data with caching."""
         current_time = time.time()
         cache_valid = (
-            self.cache["strains"] is not None and
-            self.cache["prices"] is not None and
+            self.cache["products_by_tag"] is not None and
+            self.cache["products_by_strain"] is not None and
+            self.cache["all_products"] is not None and
             current_time - self.cache["last_update"] < CACHE_EXPIRY["inventory"]
         )
         
         if cache_valid and not force_refresh:
-            return self.cache["strains"], self.cache["prices"]
+            return (
+                self.cache["products_by_tag"],
+                self.cache["products_by_strain"],
+                self.cache["all_products"]
+            )
             
         try:
             # Fetch fresh inventory data
-            strains, prices = await self.google_apis.fetch_inventory()
+            products_by_tag, products_by_strain, all_products = await self.google_apis.fetch_inventory()
             
             # Update cache
-            self.cache["strains"] = strains
-            self.cache["prices"] = prices
+            self.cache["products_by_tag"] = products_by_tag
+            self.cache["products_by_strain"] = products_by_strain
+            self.cache["all_products"] = all_products
             self.cache["last_update"] = current_time
             
             self.loggers["main"].info("Inventory cache refreshed")
-            return strains, prices
+            return products_by_tag, products_by_strain, all_products
             
         except Exception as e:
             self.loggers["errors"].error(f"Error refreshing inventory: {e}")
             
             # If we have cached data, use it despite expiry
-            if self.cache["strains"] and self.cache["prices"]:
+            if (self.cache["products_by_tag"] and 
+                self.cache["products_by_strain"] and 
+                self.cache["all_products"]):
                 self.loggers["main"].warning("Using expired inventory cache")
-                return self.cache["strains"], self.cache["prices"]
+                return (
+                    self.cache["products_by_tag"],
+                    self.cache["products_by_strain"],
+                    self.cache["all_products"]
+                )
                 
-            # Build fallback inventory from product dictionary
+            # Build fallback inventory
             self.loggers["main"].warning("Using fallback inventory")
             return self._get_fallback_inventory()
     
-    async def get_product_options(self, category):
+    async def category_has_products(self, category):
         """
-        Get options for a specific product category.
+        Check if a category has any products in stock.
         
         Args:
             category (str): Product category key
             
         Returns:
-            tuple: (options_list, prices_dict)
+            bool: True if category has products in stock, False otherwise
         """
         if category not in PRODUCTS:
-            return [], {}
+            return False
             
-        product = PRODUCTS[category]
-        
-        # For buds, we need to fetch from inventory
-        if category == "buds":
-            strains, prices = await self.get_inventory()
-            return self._flatten_strain_options(strains), prices
+        tag = PRODUCTS[category].get("tag")
+        if not tag:
+            return False
             
-        # For other categories, use the predefined options
-        elif "options" in product:
-            options = []
-            prices = {}
-            
-            for option in product["options"]:
-                name, key, price = option
-                options.append((name, key))
-                prices[key] = price
-                
-            return options, prices
-            
-        # Fallback
-        return [], {}
+        products_by_tag, _, _ = await self.get_inventory()
+        return len(products_by_tag.get(tag, [])) > 0
     
-    def _flatten_strain_options(self, strains):
+    async def calculate_price(self, category, product_key, quantity):
         """
-        Convert strain dictionary to flat options list.
-        
-        Args:
-            strains (dict): Strains organized by type
-            
-        Returns:
-            list: Flat list of (name, key) tuples
-        """
-        options = []
-        for strain_type, strain_list in strains.items():
-            for strain in strain_list:
-                options.append(strain)  # Already (name, key) format
-        return options
-    
-    def _get_fallback_inventory(self):
-        """
-        Generate fallback inventory data from product dictionary.
-        
-        Returns:
-            tuple: (strains, prices)
-        """
-        strains = {'indica': [], 'sativa': [], 'hybrid': []}
-        prices = {}
-        
-        # Add some default strains
-        for strain_type in strains:
-            for i in range(1, 3):
-                name = f"{strain_type.capitalize()} Strain {i}"
-                key = f"{strain_type}_strain_{i}"
-                strains[strain_type].append((name, key))
-                prices[key] = 2000  # Default price
-        
-        return strains, prices
-    
-    async def calculate_price(self, category, suboption, quantity):
-        """
-        Calculate price for a product based on category, type and quantity.
+        Calculate price for a product based on category and quantity.
         
         Args:
             category (str): Product category
-            suboption (str): Product suboption
+            product_key (str): Product key 
             quantity (int): Quantity
             
         Returns:
             tuple: (total_price, unit_price)
         """
-        # Get product
+        # Get category info
         if category not in PRODUCTS:
             return 0, 0
             
@@ -1305,31 +1331,79 @@ class InventoryManager:
         if category == "local":
             # Ensure minimum order
             adjusted_quantity = max(quantity, product["min_order"])
-            unit_price = product["price_per_unit"]
+            # Find product by key
+            _, _, all_products = await self.get_inventory()
+            selected_product = None
+            for p in all_products:
+                if p.get("key") == product_key:
+                    selected_product = p
+                    break
+                    
+            if not selected_product:
+                return 0, 0
+                
+            unit_price = selected_product.get("price", 0)
             # Calculate based on multiples of 10
             price_factor = adjusted_quantity / product["min_order"]
             total_price = unit_price * price_factor
             return total_price, unit_price
             
-        # For buds, get from inventory
-        elif category == "buds":
-            _, prices = await self.get_inventory()
-            if suboption in prices:
-                unit_price = prices[suboption]
-                total_price = unit_price * quantity
-                return total_price, unit_price
+        # For other products, get price directly from inventory
+        _, _, all_products = await self.get_inventory()
+        selected_product = None
+        for p in all_products:
+            if p.get("key") == product_key:
+                selected_product = p
+                break
                 
-        # For other product types, fetch from options
-        else:
-            _, prices = await self.get_product_options(category)
-            if suboption in prices:
-                unit_price = prices[suboption]
-                total_price = unit_price * quantity
-                return total_price, unit_price
-                
-        # Fallback
-        return 0, 0
+        if not selected_product:
+            return 0, 0
+            
+        unit_price = selected_product.get("price", 0)
+        total_price = unit_price * quantity
+        return total_price, unit_price
     
+    def _get_fallback_inventory(self):
+        """
+        Generate fallback inventory data.
+        
+        Returns:
+            tuple: (products_by_tag, products_by_strain, all_products)
+        """
+        products_by_tag = {'buds': [], 'local': [], 'carts': [], 'edibs': []}
+        products_by_strain = {'indica': [], 'sativa': [], 'hybrid': []}
+        all_products = []
+        
+        # Create fallback products from DEFAULT_INVENTORY
+        for item in DEFAULT_INVENTORY:
+            product_name = item.get('Name', item.get('Strain', 'Unknown'))
+            product_key = product_name.lower().replace(' ', '_')
+            product_tag = item.get('Tag', '').lower()
+            strain_type = item.get('Type', '').lower()
+            price = item.get('Price', 0)
+            stock = item.get('Stock', 0)
+            
+            product = {
+                'name': product_name,
+                'key': product_key,
+                'price': price,
+                'stock': stock,
+                'tag': product_tag,
+                'strain': strain_type,
+                'weight': item.get('Weight', ''),
+                'brand': item.get('Brand', '')
+            }
+            
+            all_products.append(product)
+            
+            if product_tag and product_tag in products_by_tag:
+                products_by_tag[product_tag].append(product)
+                
+            if strain_type and strain_type in products_by_strain:
+                products_by_strain[strain_type].append(product)
+        
+        return products_by_tag, products_by_strain, all_products
+
 # ---------------------------- Order Management ----------------------------
 class OrderManager:
     """Manages order operations and persistence."""
@@ -1533,7 +1607,7 @@ class OrderManager:
 # ---------------------------- Order Handlers ----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
-    Start the ordering conversation.
+    Start the ordering conversation with available categories.
     
     Args:
         update: Telegram update
@@ -1561,17 +1635,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_ma
     # Log the conversation start
     loggers["main"].info(f"User {user.id} ({user.full_name}) started order conversation")
     
-    # Send welcome message with category buttons
+    # Check which categories have available products
+    available_categories = []
+    for category_id in PRODUCTS:
+        has_products = await inventory_manager.category_has_products(category_id)
+        if has_products:
+            available_categories.append(category_id)
+    
+    if not available_categories:
+        await update.message.reply_text(
+            f"{EMOJI['warning']} Sorry, we don't have any products in stock at the moment. "
+            "Please check back later."
+        )
+        return ConversationHandler.END
+    
+    # Send welcome message with available category buttons
     await update.message.reply_text(
         MESSAGES["welcome"],
-        reply_markup=build_category_buttons()
+        reply_markup=build_category_buttons(available_categories)
     )
     
     return CATEGORY
 
 async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
-    Handle category selection.
+    Handle category selection and determine next steps based on category.
     
     Args:
         update: Telegram update
@@ -1585,6 +1673,11 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     query = update.callback_query
     await query.answer()
     
+    # Handle cancellation
+    if query.data == "cancel":
+        await query.edit_message_text(MESSAGES["cancel_order"])
+        return ConversationHandler.END
+    
     # Get the selected category
     category = query.data
     context.user_data["category"] = category
@@ -1592,57 +1685,63 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     # Log the selection
     loggers["main"].info(f"User {query.from_user.id} selected category: {category}")
     
-    # Handle Local (BG) directly
-    if category == "local":
-        # Store the suboption
-        context.user_data["suboption"] = "BG"
-        
-        # Get product details
-        product = PRODUCTS["local"]
-        emoji = product["emoji"]
-        unit = product["unit"]
-        min_order = product["min_order"]
-        
-        # Create the prompt
-        await query.edit_message_text(
-            f"{emoji} How many {unit} of BG would you like to order?\n\n"
-            f"{EMOJI['info']} Note: Minimum order is {min_order} {unit} (₱1000). "
-            f"Orders above {min_order} {unit} will be priced proportionally."
-        )
-        return QUANTITY
-        
-    # For other categories, show options
-    options, _ = await inventory_manager.get_product_options(category)
-    
-    if not options:
-        # Handle error case with no options
-        await query.edit_message_text(
-            f"{EMOJI['error']} Sorry, no options are available for this category right now."
-            "Please try another category.",
-            reply_markup=build_category_buttons()
-        )
+    # Get product details
+    product = PRODUCTS.get(category)
+    if not product:
+        # Invalid category, go back to selection
+        await query.edit_message_text("Invalid selection. Please try again.")
         return CATEGORY
+    
+    # Handle different category flows
+    if category == "local":
+        # For Local (BG), go directly to product selection
+        return await show_local_products(update, context, inventory_manager, loggers)
+    
+    elif category == "carts":
+        # For Carts, choose browsing option first
+        browse_options = product.get("browse_options", [])
+        keyboard = []
         
-    # Build keyboard with options
-    keyboard = [[InlineKeyboardButton(name, callback_data=data)] for name, data in options]
+        for option in browse_options:
+            option_text = f"Browse by {option.capitalize()}"
+            keyboard.append([InlineKeyboardButton(option_text, callback_data=option)])
+            
+        # Add back button
+        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")])
+        
+        await query.edit_message_text(
+            f"{product['emoji']} How would you like to browse {product['name']}?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return BROWSE_BY
     
-    # Get emoji for selected category
-    emoji = PRODUCTS[category].get("emoji", EMOJI["info"])
+    elif product.get("requires_strain_selection", False):
+        # For products requiring strain selection (buds, edibles)
+        keyboard = [
+            [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
+            [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
+            [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
+            [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
+        ]
+        
+        await query.edit_message_text(
+            f"{product['emoji']} Please select the strain type for {product['name']}:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return STRAIN_TYPE
     
-    await query.edit_message_text(
-        f"{emoji} Please choose an option:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    
-    return SUBOPTION
+    # Default fallback
+    await query.edit_message_text("This category is currently unavailable.")
+    return CATEGORY
 
-async def choose_suboption(update: Update, context: ContextTypes.DEFAULT_TYPE, loggers):
+async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
-    Handle suboption selection.
+    Handle strain type selection for products that require it.
     
     Args:
         update: Telegram update
         context: Conversation context
+        inventory_manager: Inventory manager instance
         loggers: Dictionary of logger instances
         
     Returns:
@@ -1651,33 +1750,335 @@ async def choose_suboption(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     query = update.callback_query
     await query.answer()
     
-    # Get the selected suboption
-    context.user_data["suboption"] = query.data
+    if query.data == "back_to_categories":
+        # Go back to category selection
+        return await start(update, context, inventory_manager, loggers)
+    
+    # Store the selected strain type
+    strain_type = query.data
+    context.user_data["strain_type"] = strain_type
     
     # Get the category
     category = context.user_data.get("category")
+    if not category:
+        # Something went wrong, go back to category selection
+        return await start(update, context, inventory_manager, loggers)
     
     # Log the selection
     loggers["main"].info(
-        f"User {query.from_user.id} selected {category} - {query.data}"
+        f"User {query.from_user.id} selected strain type: {strain_type} for {category}"
     )
     
-    # Get the appropriate emoji and prompt based on category
-    if category in PRODUCTS:
-        product = PRODUCTS[category]
-        emoji = product.get("emoji", "⚖️")
-        unit = product.get("unit", "units")
-        prompt = f"{emoji} How many {unit} would you like to order?"
-    else:
-        prompt = "⚖️ How many would you like to order?"
+    # Fetch products of this strain type for the selected category
+    products_by_tag, products_by_strain, _ = await inventory_manager.get_inventory()
+    
+    # Get the tag for this category
+    tag = PRODUCTS[category].get("tag", "")
+    
+    # Filter products by tag and strain
+    filtered_products = []
+    for product in products_by_strain.get(strain_type, []):
+        if product.get("tag") == tag:
+            filtered_products.append(product)
+    
+    if not filtered_products:
+        # No products available, inform the user
+        await query.edit_message_text(
+            f"Sorry, no {strain_type} {category} are currently in stock. Please try another option.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Strain Selection", callback_data="back_to_strain")],
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            ])
+        )
+        return STRAIN_TYPE
+    
+    # Build product selection keyboard
+    keyboard = []
+    for product in filtered_products:
+        product_name = product.get("name")
+        product_price = product.get("price", 0)
+        product_key = product.get("key")
+        
+        button_text = f"{product_name} - ₱{product_price:,}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
+    
+    # Add back button
+    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_strain")])
+    
+    # For edibles, show products and then ask for quantity
+    if category == "edibles":
+        await query.edit_message_text(
+            f"{EMOJI['edibles']} Select an edible ({strain_type.capitalize()}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return PRODUCT_SELECTION
+    
+    # For buds, show products and then ask for quantity
+    await query.edit_message_text(
+        f"{EMOJI['buds']} Select a {strain_type.capitalize()} strain:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PRODUCT_SELECTION
+
+async def browse_carts_by(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
+    """
+    Handle carts browsing option selection.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        inventory_manager: Inventory manager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        int: Next conversation state
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "back_to_categories":
+        # Go back to category selection
+        return await start(update, context, inventory_manager, loggers)
+    
+    # Store the browse by option
+    browse_by = query.data
+    context.user_data["browse_by"] = browse_by
+    
+    # Log the selection
+    loggers["main"].info(
+        f"User {query.from_user.id} selected to browse carts by: {browse_by}"
+    )
+    
+    # Fetch cart products
+    products_by_tag, _, _ = await inventory_manager.get_inventory()
+    cart_products = products_by_tag.get("carts", [])
+    
+    if not cart_products:
+        # No carts available, inform the user
+        await query.edit_message_text(
+            "Sorry, no carts are currently in stock. Please try another category.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            ])
+        )
+        return CATEGORY
+    
+    # Get unique options based on browse_by
+    options = set()
+    for product in cart_products:
+        option_value = product.get(browse_by, "")
+        if option_value:
+            options.add(option_value)
+    
+    if not options:
+        # No options available, inform the user
+        await query.edit_message_text(
+            f"Sorry, no carts with {browse_by} information are available. Try browsing differently.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse Options", callback_data="back_to_browse")]
+            ])
+        )
+        return BROWSE_BY
+    
+    # Build option selection keyboard
+    keyboard = []
+    for option in sorted(options):
+        keyboard.append([InlineKeyboardButton(option, callback_data=f"{browse_by}:{option}")])
+    
+    # Add back button
+    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_browse")])
+    
+    # Display options
+    await query.edit_message_text(
+        f"{EMOJI['carts']} Select {browse_by.capitalize()}:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PRODUCT_SELECTION
+
+async def show_local_products(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
+    """
+    Show local products directly after category selection.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        inventory_manager: Inventory manager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        int: Next conversation state
+    """
+    query = update.callback_query
+    
+    # Fetch local products
+    products_by_tag, _, _ = await inventory_manager.get_inventory()
+    local_products = products_by_tag.get("local", [])
+    
+    if not local_products:
+        # No local products available, inform the user
+        await query.edit_message_text(
+            "Sorry, no local products are currently in stock. Please try another category.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            ])
+        )
+        return CATEGORY
+    
+    # Build product selection keyboard
+    keyboard = []
+    for product in local_products:
+        product_name = product.get("name")
+        product_price = product.get("price", 0)
+        product_key = product.get("key")
+        
+        button_text = f"{product_name} - ₱{product_price:,}/10g"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
+    
+    # Add back button
+    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")])
+    
+    # Display local products
+    await query.edit_message_text(
+        f"{EMOJI['local']} Select a Local (BG) option:\n\n"
+        f"{EMOJI['info']} Minimum order: 10 grams",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PRODUCT_SELECTION
+
+async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
+    """
+    Handle product selection from any category.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        inventory_manager: Inventory manager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        int: Next conversation state
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Handle back navigation
+    if query.data == "back_to_categories":
+        return await start(update, context, inventory_manager, loggers)
+    elif query.data == "back_to_strain":
+        # Get the category
+        category = context.user_data.get("category")
+        # Redirect back to strain selection
+        return await choose_category(update, context, inventory_manager, loggers)
+    elif query.data == "back_to_browse":
+        # Redirect back to cart browse options
+        category = "carts"
+        context.user_data["category"] = category
+        return await choose_category(update, context, inventory_manager, loggers)
+    
+    # Handle product selection
+    category = context.user_data.get("category")
+    product_key = query.data
+    
+    # For carts with browse_by option
+    if ":" in product_key and category == "carts":
+        browse_by, option_value = product_key.split(":", 1)
+        context.user_data["option_value"] = option_value
+        
+        # Fetch cart products
+        products_by_tag, _, _ = await inventory_manager.get_inventory()
+        cart_products = products_by_tag.get("carts", [])
+        
+        # Filter products by the selected option
+        filtered_products = []
+        for product in cart_products:
+            if product.get(browse_by) == option_value:
+                filtered_products.append(product)
+        
+        if not filtered_products:
+            # No products available for this option
+            await query.edit_message_text(
+                f"Sorry, no products available for {option_value}. Please try another option.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_browse")]
+                ])
+            )
+            return PRODUCT_SELECTION
+        
+        # Build product selection keyboard
+        keyboard = []
+        for product in filtered_products:
+            product_name = product.get("name")
+            product_price = product.get("price", 0)
+            product_key = product.get("key")
+            
+            button_text = f"{product_name} - ₱{product_price:,}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
+        
+        # Add back button
+        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_browse")])
+        
+        # Display products
+        await query.edit_message_text(
+            f"{EMOJI['carts']} Select a product ({option_value}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return PRODUCT_SELECTION
+    
+    # Store the selected product
+    context.user_data["product_key"] = product_key
+    
+    # Find product details
+    products_by_tag, products_by_strain, all_products = await inventory_manager.get_inventory()
+    
+    selected_product = None
+    for product in all_products:
+        if product.get("key") == product_key:
+            selected_product = product
+            break
+    
+    if not selected_product:
+        # Product not found, go back
+        await query.edit_message_text(
+            "Sorry, this product is no longer available. Please try another one.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
+            ])
+        )
+        return CATEGORY
+    
+    # Store product details
+    context.user_data["product_name"] = selected_product.get("name")
+    context.user_data["product_price"] = selected_product.get("price", 0)
+    context.user_data["product_stock"] = selected_product.get("stock", 0)
+    
+    # Log the selection
+    loggers["main"].info(
+        f"User {query.from_user.id} selected product: {selected_product.get('name')}"
+    )
+    
+    # Get product unit and min order
+    product_info = PRODUCTS.get(category, {})
+    unit = product_info.get("unit", "units")
+    min_order = product_info.get("min_order", 1)
+    
+    # For local products, enforce minimum order
+    min_order_text = ""
+    if category == "local":
+        min_order_text = f"\n\n{EMOJI['info']} Minimum order: {min_order} {unit}"
+    
+    # Create quantity prompt
+    prompt = (
+        f"{EMOJI.get(category, '⚖️')} How many {unit} of {selected_product.get('name')} "
+        f"would you like to order? (₱{selected_product.get('price', 0):,} per {unit})"
+        f"{min_order_text}"
+    )
     
     await query.edit_message_text(prompt)
-    
     return QUANTITY
 
 async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
-    Handle quantity input.
+    Handle quantity input from user.
     
     Args:
         update: Telegram update
@@ -1691,9 +2092,10 @@ async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     user = update.message.from_user
     quantity_text = update.message.text.lower()
     
-    # Get category and suboption from context
+    # Get category and product details from context
     category = context.user_data.get("category")
-    suboption = context.user_data.get("suboption")
+    product_key = context.user_data.get("product_key")
+    product_name = context.user_data.get("product_name")
     
     # Validate quantity
     is_valid, result = validate_quantity(quantity_text, category)
@@ -1706,12 +2108,21 @@ async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     
     # Calculate price
     total_price, unit_price = await inventory_manager.calculate_price(
-        category, suboption, quantity
+        category, product_key, quantity
     )
     
     if total_price == 0:
         await update.message.reply_text(ERRORS["invalid_category"])
         return CATEGORY
+    
+    # Check stock availability
+    product_stock = context.user_data.get("product_stock", 0)
+    if quantity > product_stock:
+        await update.message.reply_text(
+            f"{EMOJI['warning']} Sorry, we only have {product_stock} in stock. "
+            f"Please enter a quantity less than or equal to {product_stock}."
+        )
+        return QUANTITY
     
     # Store in context
     context.user_data["parsed_quantity"] = quantity
@@ -1726,7 +2137,7 @@ async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     summary = (
         f"{EMOJI['cart']} Checkout Summary:\n"
         f"- Category: {category.capitalize()}\n"
-        f"- Option: {suboption.replace('_', ' ').capitalize()}\n"
+        f"- Product: {product_name}\n"
         f"- Quantity: {quantity} {unit}\n"
         f"- Unit Price: ₱{unit_price:,.2f}\n"
         f"- Total: ₱{total_price:,.2f}\n\n"
@@ -1740,7 +2151,7 @@ async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     
     # Log the selection
     loggers["main"].info(
-        f"User {user.id} selected quantity {quantity} of {category} ({suboption}) "
+        f"User {user.id} selected quantity {quantity} of {product_name} "
         f"for ₱{total_price:,.2f}"
     )
     
@@ -1769,18 +2180,18 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
     if query.data == "confirm":
         # Get item details from context
         category = context.user_data.get("category", "Unknown").capitalize()
-        suboption = context.user_data.get("suboption", "Unknown").replace("_", " ").capitalize()
+        product_name = context.user_data.get("product_name", "Unknown")
         quantity = context.user_data.get("parsed_quantity", 0)
         total_price = context.user_data.get("total_price", 0)
         
-        # Get product unit
-        product = PRODUCTS.get(category.lower(), {})
-        unit = product.get("unit", "units")
+        # Get product unit and details
+        product_info = PRODUCTS.get(category.lower(), {})
+        unit = product_info.get("unit", "units")
         
         # Create item and add to cart
         current_item = {
             "category": category,
-            "suboption": suboption,
+            "suboption": product_name,
             "quantity": quantity,
             "total_price": total_price,
             "unit": unit
@@ -1790,7 +2201,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
         
         # Log the cart addition
         loggers["orders"].info(
-            f"User {query.from_user.id} added to cart: {category} ({suboption}) "
+            f"User {query.from_user.id} added to cart: {category} ({product_name}) "
             f"x{quantity} {unit} - ₱{total_price:,.2f}"
         )
         
@@ -1806,9 +2217,21 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
     
     elif query.data == "add_more":
         # Return to category selection
+        context.user_data.pop("category", None)
+        context.user_data.pop("product_key", None)
+        context.user_data.pop("strain_type", None)
+        context.user_data.pop("browse_by", None)
+        
+        # Check available categories
+        available_categories = []
+        for category_id in PRODUCTS:
+            has_products = await inventory_manager.category_has_products(category_id)
+            if has_products:
+                available_categories.append(category_id)
+                
         await query.edit_message_text(
             f"{EMOJI['cart']} What would you like to add to your cart?",
-            reply_markup=build_category_buttons()
+            reply_markup=build_category_buttons(available_categories)
         )
         return CATEGORY
         
@@ -2981,8 +3404,14 @@ async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_category_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await choose_category(update, context, inventory_manager, loggers)
 
-async def choose_suboption_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await choose_suboption(update, context, loggers)
+async def choose_strain_type_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await choose_strain_type(update, context, inventory_manager, loggers)
+
+async def browse_carts_by_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await browse_carts_by(update, context, inventory_manager, loggers)
+
+async def select_product_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await select_product(update, context, inventory_manager, loggers)
 
 async def input_quantity_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await input_quantity(update, context, inventory_manager, loggers)
@@ -3071,13 +3500,33 @@ def main():
     conversation_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start_wrapper)],
         states={
-            CATEGORY: [CallbackQueryHandler(choose_category_wrapper)],
-            SUBOPTION: [CallbackQueryHandler(choose_suboption_wrapper)],
-            QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_quantity_wrapper)],
-            CONFIRM: [CallbackQueryHandler(confirm_order_wrapper)],
-            DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_details_wrapper)],
-            CONFIRM_DETAILS: [CallbackQueryHandler(confirm_details_wrapper)],
-            PAYMENT: [MessageHandler(filters.PHOTO, handle_payment_screenshot_wrapper)]
+            CATEGORY: [
+                CallbackQueryHandler(choose_category_wrapper)
+            ],
+            STRAIN_TYPE: [
+                CallbackQueryHandler(choose_strain_type_wrapper)
+            ],
+            BROWSE_BY: [
+                CallbackQueryHandler(browse_carts_by_wrapper)
+            ],
+            PRODUCT_SELECTION: [
+                CallbackQueryHandler(select_product_wrapper)
+            ],
+            QUANTITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_quantity_wrapper)
+            ],
+            CONFIRM: [
+                CallbackQueryHandler(confirm_order_wrapper)
+            ],
+            DETAILS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, input_details_wrapper)
+            ],
+            CONFIRM_DETAILS: [
+                CallbackQueryHandler(confirm_details_wrapper)
+            ],
+            PAYMENT: [
+                MessageHandler(filters.PHOTO, handle_payment_screenshot_wrapper)
+            ]
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -3099,6 +3548,21 @@ def main():
         conversation_timeout=300  # 5 minutes timeout
     )
     
+    # Admin tracking link input handler
+    admin_tracking_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_")],
+        states={
+            ADMIN_TRACKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tracking_link_wrapper)]
+        },
+        fallbacks=[
+            CallbackQueryHandler(skip_tracking_link_wrapper, pattern="^skip_tracking_link$"),
+            CommandHandler("cancel", cancel)
+        ],
+        name="admin_tracking_conversation",
+        persistent=True,
+        conversation_timeout=300  # 5 minutes timeout
+    )
+    
     # Admin command handler
     app.add_handler(CommandHandler("admin", admin_panel_wrapper))
     app.add_handler(CommandHandler("health", health_check))
@@ -3109,27 +3573,14 @@ def main():
     app.add_handler(CallbackQueryHandler(filter_orders_wrapper, pattern="^filter_"))
     app.add_handler(CallbackQueryHandler(manage_order_wrapper, pattern="^manage_order_"))
     app.add_handler(CallbackQueryHandler(update_order_status_wrapper, pattern="^update_status_"))
-    app.add_handler(CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_"))
     app.add_handler(CallbackQueryHandler(view_payment_screenshot_wrapper, pattern="^view_payment_"))
     app.add_handler(CallbackQueryHandler(set_order_status_wrapper, pattern="^set_status_"))
-    
-    # Message handler for admin tracking link input
-    def awaiting_tracking_link_filter(update):
-        """Filter for messages from users awaiting tracking link input"""
-        if not update.effective_chat or update.effective_chat.type != 'private':
-            return False
-            user_data = context.user_data if hasattr(update, 'user_data') else {}
-            return user_data.get('awaiting_tracking_link', False)
-
-# Message handler for admin tracking link input
-    app.add_handler(MessageHandler(
-    filters.TEXT & ~filters.COMMAND,
-    receive_tracking_link_wrapper,
-    lambda u: awaiting_tracking_link_filter(u)
-), group=1)
+    app.add_handler(CallbackQueryHandler(skip_tracking_link_wrapper, pattern="^skip_tracking_link$"))
+    app.add_handler(CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_link$"))
     
     # Add the main conversation handlers
     app.add_error_handler(error_handler)
+    app.add_handler(admin_tracking_handler)
     app.add_handler(tracking_handler)
     app.add_handler(conversation_handler)
     
