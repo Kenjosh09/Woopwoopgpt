@@ -3074,7 +3074,7 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
             ])
-            
+        
             if is_callback:
                 await update.callback_query.edit_message_text(error_message, reply_markup=reply_markup)
             else:
@@ -3208,12 +3208,28 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Use a try-except block for sending the message to handle potential errors
         try:
+            # Check if this is a refresh and if the content is the same
+            force_update = context.user_data.pop("force_message_update", False)
+    
+            # Add a timestamp to force the message to be different if needed
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if force_update:
+                # Add a small invisible character or timestamp to force an update
+                message += f"\n\n<i>Last updated: {current_time}</i>"
+    
             if is_callback:
-                await update.callback_query.edit_message_text(
-                    message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    disable_web_page_preview=True
+                # If this is a callback, check if message text is the same before updating
+                original_text = context.user_data.get("original_message_text", "")
+                if original_text == message and not force_update:
+                    # Message is identical - don't attempt to edit, just answer the callback
+                    loggers["main"].info(f"Skipping identical message update for order {order_id}")
+                else:
+                    # Message is different or we're forcing an update - proceed with edit
+                    await update.callback_query.edit_message_text(
+                        message,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        disable_web_page_preview=True
                 )
             else:
                 await update.message.reply_text(
@@ -3221,42 +3237,47 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     disable_web_page_preview=True
-                )
+            )
         except TelegramError as e:
-            loggers["errors"].error(f"Failed to send tracking info to user {update.effective_user.id}: {e}")
-            # Send a simpler fallback message
-            try:
-                if is_callback:
-                    await update.callback_query.edit_message_text(
-                        f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
-                    )
-            except:
-                pass  # Last resort - at least we logged the error
-        
-        return ConversationHandler.END
-        
+            # Check if this is a "message not modified" error, which we can safely ignore
+            if "message is not modified" in str(e).lower():
+                loggers["main"].info(f"Message for order {order_id} was not modified (identical content)")
+            else:
+                # Log other Telegram errors
+                loggers["errors"].error(f"Failed to send tracking info to user {update.effective_user.id}: {e}")
+                # Send a simpler fallback message
+                try:
+                    if is_callback:
+                        await update.callback_query.edit_message_text(
+                            f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
+                        )
+                    else:
+                        await update.message.reply_text(
+                            f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
+                        )
+                except:
+                    pass  # Last resort - at least we logged the error
     except Exception as e:
-        error_message = f"{EMOJI['error']} An error occurred while tracking your order: {str(e)}"
-        loggers["errors"].error(f"Error in track_order: {e}")
-        
+        # Log the error using your logging system
+        loggers["errors"].error(f"Error accessing sheet data: {str(e)}")
+    
+        # Prepare user-friendly error message
+        error_message = f"{EMOJI['error']} An unexpected error occurred while accessing your order. Please try again later."
         reply_markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
         ])
-        
+    
+        # Send error message based on update type
         try:
             if is_callback:
                 await update.callback_query.edit_message_text(error_message, reply_markup=reply_markup)
             else:
                 await update.message.reply_text(error_message, reply_markup=reply_markup)
         except Exception as send_error:
-            loggers["errors"].error(f"Failed to send error message: {send_error}")
-            
+            loggers["errors"].error(f"Failed to send error message: {str(send_error)}")
+    
         return ConversationHandler.END
 
 async def get_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3302,10 +3323,18 @@ async def refresh_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = query.data.replace('refresh_tracking_', '')
     
     # Store the order ID in context
-    context.user_data['track_order_id'] = order_id
+    if "track_order_id" not in context.user_data:
+        context.user_data["track_order_id"] = order_id
+    else:
+        # Update the order ID only if it's different
+        context.user_data["track_order_id"] = order_id
+    
+    # Store the original message text for comparison later
+    if query.message:
+        context.user_data["original_message_text"] = query.message.text
+        context.user_data["force_message_update"] = True
     
     # Call track_order with the proper update
-    # Create a wrapper function that handles this properly
     return await track_order(update, context)
 
 async def handle_order_tracking(
@@ -5164,11 +5193,12 @@ def main():
         app.add_handler(CommandHandler("support", support_command))
         app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
         app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
-        app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
+        # Updated with more specific pattern
+        app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_[A-Z0-9-]+$"))
         app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
+        # Remove the duplicate handler and make patterns more specific
         app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
-        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_"))
-        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_"))
+        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_[A-Z0-9-]+$"))  # Match only valid order IDs
         app.add_handler(CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$"))
         app.add_handler(CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"))
         app.add_handler(CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"))
@@ -5250,14 +5280,14 @@ def main():
                     CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$")
                 ],
                 TRACKING: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_tracking_wrapper)f
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_tracking_wrapper)
                 ]
-                    },
+            },
             fallbacks=[CommandHandler("cancel", cancel)],
             name="tracking_conversation",
             persistent=True,
             conversation_timeout=300  # 5 minutes timeout
-        )   
+        )  
     
         # Admin tracking link input handler
         admin_tracking_handler = ConversationHandler(
@@ -5281,17 +5311,19 @@ def main():
         # Admin panel callback handlers
         app.add_handler(CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$"))
         app.add_handler(CallbackQueryHandler(admin_panel.view_orders, pattern="^view_orders$"))
-        app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.view_orders(update, context), pattern="^filter_"))
-        app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.manage_order(update, context), pattern="^manage_order_"))
-        app.add_handler(CallbackQueryHandler(admin_panel.update_order_status, pattern="^update_status_"))
-        app.add_handler(CallbackQueryHandler(admin_panel.view_payment_screenshot, pattern="^view_payment_"))
-        app.add_handler(CallbackQueryHandler(admin_panel.set_order_status, pattern="^set_status_"))
+        # Updated with more specific patterns
+        app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.view_orders(update, context), pattern="^filter_[a-z_]+$"))
+        app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.manage_order(update, context), pattern="^manage_order_[A-Z0-9-]+$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.update_order_status, pattern="^update_status_[A-Z0-9-]+$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.view_payment_screenshot, pattern="^view_payment_[A-Z0-9-]+$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.set_order_status, pattern="^set_status_[a-z_]+$"))
         app.add_handler(CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"))
         app.add_handler(CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_link$"))
         app.add_handler(admin_search_handler)
         app.add_handler(CallbackQueryHandler(admin_panel.review_payments, pattern="^approve_payments$"))
-        app.add_handler(CallbackQueryHandler(admin_panel.review_specific_payment, pattern="^review_payment_"))
-        app.add_handler(CallbackQueryHandler(admin_panel.process_payment_action, pattern="^approve_payment_|^reject_payment_"))
+        # Updated with more specific patterns
+        app.add_handler(CallbackQueryHandler(admin_panel.review_specific_payment, pattern="^review_payment_[A-Z0-9-]+$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.process_payment_action, pattern="^(approve|reject)_payment_[A-Z0-9-]+$"))
         
         # Add force restart command
         app.add_handler(CommandHandler("restart", force_restart))
