@@ -14,6 +14,9 @@ import io
 from io import BytesIO
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from collections import deque
+import string
+from typing import Optional, Tuple, Dict, Any, List
 
 # Import Telegram components
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -26,10 +29,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
     Application,
-    PicklePersistence
+    PicklePersistence,
+    TypeHandler
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError, TimedOut
 
 # Import Google API components
 import gspread
@@ -48,6 +53,9 @@ load_dotenv()
 # States for the ConversationHandler
 CATEGORY, STRAIN_TYPE, BROWSE_BY, PRODUCT_SELECTION, QUANTITY, CONFIRM, DETAILS, CONFIRM_DETAILS, PAYMENT, TRACKING = range(10)
 ADMIN_SEARCH, ADMIN_TRACKING = 10, 11
+
+# Define conversation states
+TRACK_ORDER = 1
 
 # Get configuration from environment variables or use defaults
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7870716772:AAFn8Gjay6Ok6a3YeqU1WIZdmixQbMCHfiI")
@@ -108,6 +116,39 @@ EMOJI = {
     "update": "💫"
 }
 
+if "restart" not in EMOJI:
+        EMOJI.update({
+            "restart": "🔄",
+            "help": "❓",
+            "home": "🏠",
+            "browse": "🛒",
+            "order": "📦",
+            "clock": "⏰",
+            "error": "❌",
+            "warning": "⚠️",
+            "success": "✅",
+            "alert": "🚨",
+            "payment": "💳",
+            "id": "🔢",
+            "customer": "👤",
+            "money": "💰",
+            "date": "📅",
+            "phone": "📱",
+            "address": "🏠",
+            "status": "📊",
+            "link": "🔗",
+            "search": "🔍",
+            "screenshot": "📸",
+            "update": "🔄",
+            "cart": "🛒",
+            "back": "⬅️",
+            "info": "ℹ️",
+            "package": "📦",
+            "truck": "🚚",
+            "party": "🎉",
+            "support": "🧑‍💼"
+        })
+
 # ---------------------------- Product Dictionary ----------------------------
 PRODUCTS = {
     "buds": {
@@ -115,7 +156,7 @@ PRODUCTS = {
         "emoji": EMOJI["buds"],
         "description": "High-quality cannabis flowers",
         "min_order": 1,
-        "unit": "grams",
+        "unit": "gram/s",
         "tag": "buds",
         "requires_strain_selection": True
     },
@@ -124,7 +165,7 @@ PRODUCTS = {
         "emoji": EMOJI["local"],
         "description": "Local budget-friendly option",
         "min_order": 10,
-        "unit": "grams",
+        "unit": "gram/s",
         "tag": "local",
         "price_per_unit": 1000
     },
@@ -133,7 +174,7 @@ PRODUCTS = {
         "emoji": EMOJI["carts"],
         "description": "Pre-filled vape cartridges",
         "min_order": 1,
-        "unit": "units",
+        "unit": "unit/s",
         "tag": "carts",
         "browse_options": ["brand", "weight"]
     },
@@ -142,7 +183,7 @@ PRODUCTS = {
         "emoji": EMOJI["edibles"],
         "description": "Cannabis-infused food products",
         "min_order": 1,
-        "unit": "packs",
+        "unit": "pack/s",
         "tag": "edibs",
         "requires_strain_selection": True
     }
@@ -312,7 +353,7 @@ SHEET_COLUMN_INDICES = {name: idx+1 for idx, name in enumerate(SHEET_HEADERS)}
 
 # ---------------------------- Regular Expressions ----------------------------
 REGEX = {
-    "shipping_details": r"^(?P<n>[\w\s]+)\s*/\s*(?P<address>[\w\s,]+)\s*/\s*(?P<contact>\+?\d{10,15})$",
+    "shipping_details": r"^(?P<name>[\w\s\.]+)\s*/\s*(?P<address>[\w\s,\.\-\#\/]+)\s*/\s*(?P<contact>\+?[\d\s\-]{10,15})$",
     "quantity": r"(\d+)"
 }
 
@@ -363,6 +404,13 @@ def setup_logging():
         "admin": logging.getLogger("admin")
     }
     
+    if "performance" not in loggers:
+        # Create additional loggers if they don't exist yet
+        loggers.update({
+            "performance": create_logger("performance", "performance.log"),
+            "status": create_logger("status", "status.log")
+        })
+
     # Configure each logger
     for name, logger in loggers.items():
         logger.setLevel(logging.INFO)
@@ -388,6 +436,75 @@ def setup_logging():
         console.setLevel(logging.INFO)
         console.setFormatter(formatter)
         logger.addHandler(console)
+    
+    return loggers
+
+def create_logger(name: str, log_file: str, log_level=logging.INFO) -> logging.Logger:
+    """
+    Create a logger with the specified name and file.
+    
+    Args:
+        name: Name of the logger
+        log_file: Path to the log file
+        log_level: Logging level (default: logging.INFO)
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create full path to log file
+    log_path = os.path.join(logs_dir, log_file)
+    
+    # Create logger
+    logger = logging.getLogger(name)
+    logger.setLevel(log_level)
+    
+    # Check if logger already has handlers to prevent duplicates
+    if not logger.handlers:
+        # Create rotating file handler (10MB max size, keep 5 backup files)
+        file_handler = RotatingFileHandler(
+            log_path, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+        )
+        
+        # Create formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Set formatter for handler
+        file_handler.setFormatter(formatter)
+        
+        # Add handler to logger
+        logger.addHandler(file_handler)
+    
+    return logger
+
+def initialize_loggers() -> dict:
+    """
+    Initialize all required loggers for the application.
+    
+    Returns:
+        dict: Dictionary containing all logger instances
+    """
+    # Initialize a dictionary to store all loggers
+    loggers = {
+        "main": create_logger("main", "main.log"),
+        "errors": create_logger("errors", "errors.log"),
+        "admin": create_logger("admin", "admin.log"),
+        "orders": create_logger("orders", "orders.log"),
+        "payments": create_logger("payments", "payments.log"),
+        "performance": create_logger("performance", "performance.log"),
+        "status": create_logger("status", "status.log"),
+        "users": create_logger("users", "users.log"),
+        "security": create_logger("security", "security.log")
+    }
+
+# Log startup message
+    loggers["main"].info("Bot logging system initialized")
     
     return loggers
 
@@ -1069,7 +1186,7 @@ def validate_quantity(text, category=None):
 
 def validate_shipping_details(text):
     """
-    Validate shipping details format.
+    Validate shipping details format with enhanced debugging.
     
     Args:
         text (str): Shipping details text
@@ -1077,11 +1194,39 @@ def validate_shipping_details(text):
     Returns:
         tuple: (is_valid, result_dict_or_error_message)
     """
+    # Basic format check
+    if text.count('/') != 2:
+        return False, "Invalid format. Need exactly two '/' separators. Format: Name / Address / Contact"
+    
+    # Try with standard pattern first
     pattern = REGEX["shipping_details"]
     match = re.match(pattern, text)
     
     if not match:
-        return False, "Invalid format. Use: Name / Address / Contact"
+        # Split manually to provide better error message
+        parts = [part.strip() for part in text.split('/')]
+        if len(parts) != 3:
+            return False, "Invalid format. Use: Name / Address / Contact"
+            
+        name, address, contact = parts
+        
+        # Check each part
+        if not name:
+            return False, "Name cannot be empty. Format: Name / Address / Contact"
+        if not address:
+            return False, "Address cannot be empty. Format: Name / Address / Contact"
+            
+        # Contact validation
+        contact_pattern = r"^\+?[\d\s\-]{10,15}$"
+        if not re.match(contact_pattern, contact):
+            return False, "Invalid contact number. Must be 10-15 digits, can include +, spaces, or hyphens."
+        
+        # If we get this far, manual parsing worked but regex failed - let's use manual results
+        return True, {
+            "name": sanitize_input(name, 50),
+            "address": sanitize_input(address, 100),
+            "contact": sanitize_input(contact, 15)
+        }
     
     # Extract the matched groups
     groups = match.groupdict()
@@ -1863,6 +2008,7 @@ async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_T
 async def back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Navigate back to the categories selection screen.
+    Works from both callback queries and direct commands.
     
     Args:
         update: Telegram update
@@ -1873,7 +2019,16 @@ async def back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE,
     Returns:
         int: Next conversation state (CATEGORY)
     """
-    query = update.callback_query
+    # Determine if this is from a callback query or direct message
+    if update.callback_query:
+        user = update.callback_query.from_user
+        is_callback = True
+    else:
+        user = update.message.from_user
+        is_callback = False
+    
+    # Log the navigation action
+    loggers["main"].info(f"User {user.id} navigating back to categories")
     
     # Clear navigation-related context variables
     context.user_data.pop("category", None)
@@ -1897,11 +2052,21 @@ async def back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE,
             # If there's an error, include the category anyway to avoid blocking the flow
             available_categories.append(category_id)
     
-    # Build the category buttons
-    await query.edit_message_text(
-        MESSAGES["choose_category"],
-        reply_markup=build_category_buttons(available_categories)
-    )
+    # Build the welcome message with category buttons
+    welcome_message = MESSAGES["welcome"]
+    categories_markup = build_category_buttons(available_categories)
+    
+    # Send response based on update type
+    if is_callback:
+        await update.callback_query.edit_message_text(
+            welcome_message,
+            reply_markup=categories_markup
+        )
+    else:
+        await update.message.reply_text(
+            welcome_message,
+            reply_markup=categories_markup
+        )
     
     return CATEGORY
 async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
@@ -2398,9 +2563,26 @@ async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     quantity = result
     
     # Calculate price with discount handling
-    total_price, unit_price, regular_price, discount_info = await inventory_manager.calculate_price(
-        category, product_key, quantity
-    )
+    try:
+        # Calculate price with possible discount handling
+        price_result = await inventory_manager.calculate_price(
+            category, product_key, quantity
+        )
+        
+        # Handle both 2-value and 4-value returns
+        if len(price_result) == 4:
+            total_price, unit_price, regular_price, discount_info = price_result
+        else:
+            total_price, unit_price = price_result
+            regular_price = None
+            discount_info = ""
+            
+    except Exception as e:
+        loggers["errors"].error(f"Error calculating price: {str(e)}")
+        await update.message.reply_text(
+            f"{EMOJI['error']} Sorry, there was an error processing your selection. Please try again."
+        )
+        return CATEGORY
     
     if total_price == 0:
         await update.message.reply_text(ERRORS["invalid_category"])
@@ -2773,33 +2955,223 @@ async def handle_payment_screenshot(
         await update.message.reply_text(MESSAGES["invalid_payment"])
         return PAYMENT
 
-async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE, loggers):
+async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Start the order tracking process.
+    Track the status of an order.
     
     Args:
-        update: Telegram update
-        context: Conversation context
-        loggers: Dictionary of logger instances
+        update: Telegram update object
+        context: Context object
         
     Returns:
         int: Next conversation state
     """
-    user = update.message.from_user
+    # Get the order ID from context (if set by a previous step)
+    order_id = context.user_data.get('track_order_id')
     
-    # Check rate limits
-    if not check_rate_limit(context, user.id, "track"):
+    # If no order ID is set, prompt the user to enter one
+    if not order_id:
         await update.message.reply_text(
-            f"{EMOJI['warning']} You've reached the maximum number of tracking requests allowed per hour. "
-            "Please try again later."
+            f"{EMOJI['search']} Please enter your Order ID to track its status:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
+        )
+        return TRACK_ORDER
+    
+    # Initialize sheets
+    sheet, _ = await google_apis.initialize_sheets()
+    if not sheet:
+        await update.message.reply_text(
+            ERRORS["sheet_init_failed"],
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
         )
         return ConversationHandler.END
     
-    # Log the tracking attempt
-    loggers["main"].info(f"User {user.id} initiated order tracking")
+    # Get orders
+    orders = sheet.get_all_records()
     
-    await update.message.reply_text(MESSAGES["tracking_prompt"])
-    return TRACKING
+    # Find the order
+    found_order = None
+    for order in orders:
+        if order.get('Order ID') == order_id and order.get('Product') == "COMPLETE ORDER":
+            found_order = order
+            break
+    
+    if not found_order:
+        await update.message.reply_text(
+            MESSAGES["order_not_found"].format(order_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
+        )
+        context.user_data.pop('track_order_id', None)
+        return ConversationHandler.END
+    
+    # Get order details
+    status = found_order.get('Status', 'Pending')
+    order_date = found_order.get('Order Date', 'Unknown')
+    notes = found_order.get('Notes', '')
+    price = found_order.get('Price', '₱0')
+    tracking_link = found_order.get('Tracking Link', '')
+    
+    # Parse the notes field to extract items
+    items_text = ""
+    if notes:
+        # Split notes by line
+        items_list = [line.strip() for line in notes.split('\n') if line.strip()]
+        
+        # Format each item line
+        for item in items_list:
+            # Remove any leading bullets or markers
+            clean_item = item.lstrip('•').strip()
+            
+            # Check if this is an actual item line
+            if 'x ' in clean_item and ':' in clean_item:
+                try:
+                    # Extract quantity, product, and price
+                    quantity_part, rest = clean_item.split('x ', 1)
+                    product_info, price_part = rest.split(':', 1)
+                    
+                    # Clean up any extra spaces
+                    quantity = quantity_part.strip()
+                    product = product_info.strip()
+                    
+                    # Format price more cleanly
+                    price_match = re.search(r'(₱[\d,]+\.\d{2})', price_part)
+                    price_str = price_match.group(1) if price_match else price_part.strip()
+                    
+                    # Check for strain in parentheses
+                    if "(" in product and ")" in product:
+                        product_name, strain_info = product.split("(", 1)
+                        strain_info = strain_info.rstrip(")")
+                        # Format as Product - Strain
+                        items_text += f"• {quantity}x {product_name.strip()} - {strain_info} - {price_str}\n"
+                    else:
+                        items_text += f"• {quantity}x {product} - {price_str}\n"
+                except Exception as e:
+                    # If parsing fails, just use the original line
+                    items_text += f"• {clean_item}\n"
+                    loggers["errors"].warning(f"Error parsing item line: {e}")
+            else:
+                # Not a standard item line, include as is
+                items_text += f"• {clean_item}\n"
+    
+    if not items_text:
+        items_text = "• No detailed items found"
+    
+    # Create the tracking message
+    message = (
+        f"{EMOJI['package']} *Order Status Update*\n\n"
+        f"{EMOJI['id']} Order ID: {order_id}\n"
+        f"{EMOJI['date']} Ordered on: {order_date}\n"
+        f"{EMOJI['status']} Status: {status}\n"
+        f"{EMOJI['cart']} Items:\n{items_text}\n"
+        f"{EMOJI['money']} Total: {price}\n"
+    )
+    
+    # Add tracking link if available
+    if tracking_link:
+        message += f"\n{EMOJI['link']} *Track your delivery:* {tracking_link}\n"
+    
+    # Add contextual hints based on status
+    status_lower = status.lower()
+    if "pending" in status_lower or "processing" in status_lower:
+        message += (
+            f"\n{EMOJI['info']} Your order is being processed. "
+            f"We'll update you when it ships!"
+        )
+    elif "payment" in status_lower and "rejected" in status_lower:
+        message += (
+            f"\n{EMOJI['warning']} Your payment was rejected. "
+            f"Please contact support for assistance."
+        )
+    elif "payment" in status_lower and "pending" in status_lower:
+        message += (
+            f"\n{EMOJI['info']} We're waiting for your payment confirmation. "
+            f"Please complete payment to proceed."
+        )
+    elif "shipped" in status_lower or "transit" in status_lower:
+        message += (
+            f"\n{EMOJI['truck']} Your order is on its way! "
+            f"Use the tracking link above to follow your delivery."
+        )
+    elif "delivered" in status_lower or "completed" in status_lower:
+        message += (
+            f"\n{EMOJI['party']} Your order has been delivered! "
+            f"Thank you for shopping with us."
+        )
+    
+    # Create the keyboard buttons
+    keyboard = [
+        [InlineKeyboardButton("🔄 Refresh Status", callback_data=f"refresh_tracking_{order_id}")],
+        [InlineKeyboardButton(f"{EMOJI['support']} Need Help?", callback_data="contact_support")],
+        [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+    ]
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
+    
+    return ConversationHandler.END
+
+async def get_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler for getting the order ID from user input.
+    
+    Args:
+        update: Telegram update object
+        context: Context object
+        
+    Returns:
+        int: Next conversation state
+    """
+    # Get the order ID from the message
+    order_id = update.message.text.strip()
+    
+    # Validate the order ID format (basic validation)
+    if not order_id or len(order_id) < 5:
+        await update.message.reply_text(
+            f"{EMOJI['error']} Please enter a valid Order ID.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
+        )
+        return TRACK_ORDER
+    
+    # Store the order ID in context
+    context.user_data['track_order_id'] = order_id
+    
+    # Call the track_order function to display order status
+    return await track_order(update, context)
+
+async def refresh_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler for refreshing order tracking status.
+    
+    Args:
+        update: Telegram update object
+        context: Context object
+        
+    Returns:
+        int: Next conversation state
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract order ID from callback data
+    order_id = query.data.replace('refresh_tracking_', '')
+    
+    # Store the order ID in context
+    context.user_data['track_order_id'] = order_id
+    
+    # Call track_order to display updated status
+    return await track_order(update.get_callback_query(), context)
 
 async def handle_order_tracking(
     update: Update, context: ContextTypes.DEFAULT_TYPE, 
@@ -3027,6 +3399,261 @@ async def view_orders(
         message, 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+async def review_payments(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers):
+    """
+    Display a list of orders with pending payment status for review.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        google_apis: GoogleAPIsManager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        None
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Log the action
+    user = query.from_user
+    loggers["admin"].info(f"Admin {user.id} accessed payment review")
+    
+    # Initialize sheets
+    sheet, _ = await google_apis.initialize_sheets()
+    if not sheet:
+        await query.edit_message_text(
+            f"{EMOJI['error']} Failed to access order data. Please try again later.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
+        return
+    
+    # Get orders
+    orders = sheet.get_all_records()
+    
+    # Filter for orders with pending payment status
+    pending_payments = []
+    for order in orders:
+        if (order.get('Product') == "COMPLETE ORDER" and 
+            order.get('Status', '').lower() == "pending payment review"):
+            pending_payments.append(order)
+    
+    # Check if we have any pending payments
+    if not pending_payments:
+        await query.edit_message_text(
+            f"{EMOJI['info']} No orders pending payment review at this time.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
+        return
+    
+    # Sort by date (newest first)
+    pending_payments.sort(key=lambda x: x.get('Order Date', ''), reverse=True)
+    
+    # Create a message with pending payment orders (show up to 5)
+    message = f"{EMOJI['payment']} Orders Pending Payment Review:\n\n"
+    
+    display_orders = pending_payments[:5]
+    
+    # Create order buttons
+    payment_buttons = []
+    for order in display_orders:
+        order_id = order.get('Order ID', 'Unknown')
+        customer = order.get('Customer Name', order.get('Name', 'Unknown Customer'))
+        date = order.get('Order Date', 'N/A')
+        total = order.get('Price', order.get('Total Price', '₱0'))
+        
+        # Add order summary to message
+        message += (
+            f"{EMOJI['id']} {order_id}\n"
+            f"{EMOJI['customer']} {customer}\n"
+            f"{EMOJI['money']} {total}\n"
+            f"{EMOJI['date']} {date}\n"
+            f"------------------------\n"
+        )
+        
+        # Add button for this order
+        payment_buttons.append([
+            InlineKeyboardButton(
+                f"Review: {order_id}", 
+                callback_data=f'review_payment_{order_id}'
+            )
+        ])
+    
+    # Create navigation buttons if there are more orders
+    nav_buttons = []
+    if len(pending_payments) > 5:
+        nav_buttons = [[
+            InlineKeyboardButton("◀️ Previous", callback_data="prev_payments"),
+            InlineKeyboardButton("Next ▶️", callback_data="next_payments")
+        ]]
+    
+    # Combine all buttons
+    keyboard = (
+        payment_buttons + 
+        nav_buttons + 
+        [[InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]]
+    )
+    
+    await query.edit_message_text(
+        message, 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def review_specific_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers, order_manager):
+    """
+    Review a specific payment and provide options to approve or reject.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        google_apis: GoogleAPIsManager instance
+        loggers: Dictionary of logger instances
+        order_manager: OrderManager instance
+        
+    Returns:
+        None
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract order ID from callback data
+    order_id = query.data.replace('review_payment_', '')
+    
+    # Store order ID in context
+    context.user_data['current_order_id'] = order_id
+    
+    # Get order details
+    order_details = await order_manager.get_order_details(order_id)
+    
+    if not order_details:
+        await query.edit_message_text(
+            MESSAGES["order_not_found"].format(order_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Payment Review", callback_data='approve_payments')]
+            ])
+        )
+        return
+    
+    # Extract order information
+    customer = order_details.get('Customer Name', order_details.get('Name', 'Unknown'))
+    address = order_details.get('Address', 'No address provided')
+    contact = order_details.get('Contact', order_details.get('Phone', 'No contact provided'))
+    status = order_details.get('Status', 'Unknown')
+    date = order_details.get('Order Date', 'N/A')
+    total = order_details.get('Price', order_details.get('Total Price', '₱0'))
+    payment_url = order_details.get('Payment URL', 'N/A')
+    
+    # Build message
+    message = (
+        f"{EMOJI['payment']} Payment Review: {order_id}\n\n"
+        f"{EMOJI['customer']} Customer: {customer}\n"
+        f"{EMOJI['phone']} Contact: {contact}\n"
+        f"{EMOJI['address']} Address: {address}\n"
+        f"{EMOJI['date']} Date: {date}\n"
+        f"{EMOJI['status']} Status: {status}\n"
+        f"{EMOJI['money']} Total: {total}\n\n"
+        f"{EMOJI['screenshot']} Payment Screenshot: {payment_url}\n\n"
+        f"{EMOJI['cart']} Items:\n{order_details.get('Notes', '• No detailed items found')}\n\n"
+        f"Please verify the payment screenshot and select an action below:"
+    )
+    
+    # Create action buttons
+    keyboard = [
+        [InlineKeyboardButton(f"{EMOJI['success']} Approve Payment", callback_data=f'approve_payment_{order_id}')],
+        [InlineKeyboardButton(f"{EMOJI['error']} Reject Payment", callback_data=f'reject_payment_{order_id}')],
+        [InlineKeyboardButton(f"{EMOJI['back']} Back to Payment Review", callback_data='approve_payments')]
+    ]
+    
+    # Log the action
+    loggers["admin"].info(f"Admin reviewing payment for order {order_id}")
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
+
+async def process_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE, order_manager, loggers):
+    """
+    Process payment approval or rejection.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        order_manager: OrderManager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        None
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Determine action type and order ID
+    action_data = query.data
+    order_id = context.user_data.get('current_order_id')
+    
+    if not order_id:
+        # Extract from callback data as fallback
+        if action_data.startswith('approve_payment_'):
+            order_id = action_data.replace('approve_payment_', '')
+        elif action_data.startswith('reject_payment_'):
+            order_id = action_data.replace('reject_payment_', '')
+    
+    if not order_id:
+        await query.edit_message_text(
+            f"{EMOJI['error']} Error: Order ID not found.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
+        return
+    
+    # Set new status based on action
+    if action_data.startswith('approve_payment_'):
+        new_status = STATUS["payment_confirmed"]["label"]
+        action_type = "approved"
+    elif action_data.startswith('reject_payment_'):
+        new_status = STATUS["payment_rejected"]["label"]
+        action_type = "rejected"
+    else:
+        await query.edit_message_text(
+            f"{EMOJI['error']} Invalid action selected.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
+        return
+    
+    # Update order status
+    success = await order_manager.update_order_status(context, order_id, new_status)
+    
+    if success:
+        # Log the action
+        loggers["admin"].info(f"Admin {action_type} payment for order {order_id}")
+        
+        keyboard = [
+            [InlineKeyboardButton("Back to Payment Review", callback_data='approve_payments')],
+            [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+        ]
+        
+        await query.edit_message_text(
+            f"{EMOJI['success']} Payment for Order {order_id} has been {action_type}.\n\n"
+            f"Status updated to: {new_status}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await query.edit_message_text(
+            ERRORS["update_failed"].format(order_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
 
 def build_filter_buttons(current_filter):
     """
@@ -3587,6 +4214,134 @@ async def back_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_admin_buttons()
     )
 
+async def search_order_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Display a prompt for entering an order ID to search.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        
+    Returns:
+        int: Next conversation state
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    # Let user know we're expecting an order ID
+    await query.edit_message_text(
+        f"{EMOJI['search']} Please enter the Order ID you want to search for:\n\n"
+        f"Example: WW-1234-ABC",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data="back_to_admin")]
+        ])
+    )
+    
+    # Set context to indicate we're waiting for an order ID
+    context.user_data['awaiting_order_id'] = True
+    
+    # Return the ADMIN_SEARCH state to wait for text input
+    return ADMIN_SEARCH
+
+async def handle_admin_search(update: Update, context: ContextTypes.DEFAULT_TYPE, google_apis, loggers):
+    """
+    Handle order ID input for order searching.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        google_apis: GoogleAPIsManager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        int: Next conversation state
+    """
+    # Only process if we're awaiting an order ID
+    if not context.user_data.get('awaiting_order_id', False):
+        return
+    
+    # Clear the flag
+    context.user_data['awaiting_order_id'] = False
+    
+    # Get the order ID from message
+    order_id = update.message.text.strip()
+    
+    # Log the search attempt
+    user = update.message.from_user
+    loggers["admin"].info(f"Admin {user.id} searched for order {order_id}")
+    
+    # Initialize sheets
+    sheet, _ = await google_apis.initialize_sheets()
+    if not sheet:
+        await update.message.reply_text(
+            f"{EMOJI['error']} Failed to access order data. Please try again later.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
+        return
+    
+    # Get orders
+    orders = sheet.get_all_records()
+    
+    # Find the order
+    found_order = None
+    for order in orders:
+        if order.get('Order ID') == order_id and order.get('Product') == "COMPLETE ORDER":
+            found_order = order
+            break
+    
+    if not found_order:
+        await update.message.reply_text(
+            MESSAGES["order_not_found"].format(order_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+            ])
+        )
+        return
+    
+    # Create detailed order message with safe gets
+    customer = found_order.get('Customer Name', found_order.get('Name', 'Unknown'))
+    address = found_order.get('Address', 'No address provided')
+    contact = found_order.get('Contact', found_order.get('Phone', 'No contact provided'))
+    status = found_order.get('Status', 'Unknown')
+    date = found_order.get('Order Date', 'N/A')
+    total = found_order.get('Price', found_order.get('Total Price', '₱0'))
+    payment_url = found_order.get('Payment URL', 'N/A')
+    tracking_link = found_order.get('Tracking Link', '')
+    
+    message = (
+        f"{EMOJI['search']} Order Details: {order_id}\n\n"
+        f"{EMOJI['customer']} Customer: {customer}\n"
+        f"{EMOJI['phone']} Contact: {contact}\n"
+        f"{EMOJI['address']} Address: {address}\n"
+        f"{EMOJI['date']} Date: {date}\n"
+        f"{EMOJI['status']} Status: {status}\n"
+        f"{EMOJI['money']} Total: {total}\n\n"
+    )
+    
+    # Add tracking link if available
+    if tracking_link:
+        message += f"{EMOJI['link']} Tracking: {tracking_link}\n\n"
+    
+    # Add order items from Notes field
+    message += f"{EMOJI['cart']} Items:\n{found_order.get('Notes', '• No detailed items found')}\n"
+    
+    # Create management buttons
+    keyboard = [
+        [InlineKeyboardButton(f"{EMOJI['update']} Update Status", callback_data=f'update_status_{order_id}')],
+        [InlineKeyboardButton(f"{EMOJI['link']} Add/Update Tracking", callback_data=f'add_tracking_{order_id}')],
+        [InlineKeyboardButton(f"{EMOJI['screenshot']} View Payment Screenshot", callback_data=f'view_payment_{order_id}')]
+    ]
+    
+    # Add back button
+    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')])
+    
+    await update.message.reply_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True  # Prevent tracking links from generating previews
+    )
 # ---------------------------- Conversation Cancellation & Utilities ----------------------------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3710,6 +4465,403 @@ async def error_handler(update, context):
         except Exception as error:
             loggers["errors"].error(f"Failed to send error message to the user: {error}")
 
+async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Enhanced error handler for catching and logging errors, and notifying users.
+    
+    Args:
+        update: Telegram update that caused the error
+        context: Context with error details
+    """
+    # Get the exception from the context
+    error = context.error
+    
+    # Get user and chat information
+    user_id = None
+    chat_id = None
+    message_id = None
+    
+    try:
+        if update and update.effective_user:
+            user_id = update.effective_user.id
+        if update and update.effective_chat:
+            chat_id = update.effective_chat.id
+        if update and update.effective_message:
+            message_id = update.effective_message.message_id
+    except Exception as e:
+        loggers["errors"].error(f"Error retrieving user/chat information: {e}")
+    
+    # Log the error details
+    error_text = f"User: {user_id} | Chat: {chat_id} | Error: {type(error).__name__}: {error}"
+    loggers["errors"].error(f"Error in enhanced_error_handler | {error_text}")
+    
+    # Generate a unique error reference code
+    error_ref = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    loggers["errors"].error(f"Error reference: {error_ref} | {error_text}")
+    
+    # Send a notification to admin about the error
+    try:
+        for admin_id in ADMIN_ID:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"{EMOJI['error']} *BOT ERROR ALERT* {EMOJI['error']}\n\n"
+                    f"*Error Reference:* `{error_ref}`\n"
+                    f"*Type:* `{type(error).__name__}`\n"
+                    f"*Details:* `{error}`\n"
+                    f"*User ID:* `{user_id}`\n"
+                    f"*Chat ID:* `{chat_id}`\n"
+                    f"*Time:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+    except Exception as e:
+        loggers["errors"].error(f"Failed to notify admin about error: {e}")
+    
+    # Provide user-friendly error message and recovery options
+    try:
+        if chat_id:
+            # Create recovery keyboard
+            keyboard = [
+                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
+                [InlineKeyboardButton(f"{EMOJI['help']} Get Help", callback_data="get_help")],
+                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+            ]
+            
+            # Determine the message based on error type
+            if isinstance(error, (NetworkError, TelegramError, TimedOut)):
+                error_message = (
+                    f"{EMOJI['warning']} *Oops! Connection issue detected*\n\n"
+                    f"The bot is having trouble connecting to Telegram servers. "
+                    f"This could be due to network issues or server load.\n\n"
+                    f"*What you can do:*\n"
+                    f"• Wait a moment and try again\n"
+                    f"• Restart the conversation using the button below\n"
+                    f"• Contact support if the issue persists\n\n"
+                    f"Error Reference: `{error_ref}`"
+                )
+            elif isinstance(error, ConversationTimeout):
+                error_message = (
+                    f"{EMOJI['clock']} *Conversation Timed Out*\n\n"
+                    f"Your session was inactive for too long and has been reset. "
+                    f"Don't worry, your data is safe!\n\n"
+                    f"Use the buttons below to restart."
+                )
+            else:
+                error_message = (
+                    f"{EMOJI['error']} *Something went wrong*\n\n"
+                    f"The bot encountered an unexpected error while processing your request. "
+                    f"Our team has been notified and is working to fix it.\n\n"
+                    f"*What you can do:*\n"
+                    f"• Restart the conversation using the button below\n"
+                    f"• Try again later if the issue persists\n"
+                    f"• Contact support with reference code: `{error_ref}`"
+                )
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=error_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # End any ongoing conversation
+            return ConversationHandler.END
+            
+    except Exception as e:
+        loggers["errors"].error(f"Failed to send error message to the user: {e}")
+
+async def navigation_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle errors that occur during navigation.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    error = context.error
+    user_id = update.effective_user.id if update.effective_user else "Unknown"
+    
+    # Log the error
+    loggers["errors"].error(f"Navigation error for user {user_id}: {error}")
+    
+    # Try to recover by returning to categories
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                f"{EMOJI['error']} An error occurred while navigating. Let's start again.",
+                reply_markup=build_category_buttons([k for k in PRODUCTS.keys()])
+            )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['error']} An error occurred while navigating. Let's start again.",
+                reply_markup=build_category_buttons([k for k in PRODUCTS.keys()])
+            )
+        return CATEGORY
+    except Exception as e:
+        loggers["errors"].error(f"Failed to recover from navigation error: {e}")
+        return ConversationHandler.END
+    
+class HealthCheckMiddleware:
+    """Middleware to track response times and detect when the bot becomes unresponsive."""
+    
+    def __init__(self, bot, admin_ids, loggers):
+        self.bot = bot
+        self.admin_ids = admin_ids
+        self.loggers = loggers
+        self.response_times = deque(maxlen=100)  # Track the last 100 response times
+        self.is_responding = True
+        self.last_activity = time.time()
+        self.watchdog_timer = None
+        self.start_watchdog()
+    
+    async def on_pre_process_update(self, update: Update, data: dict):
+        """Pre-process each update to record the start time."""
+        data["process_start_time"] = time.time()
+        self.last_activity = time.time()
+        
+    async def on_post_process_update(self, update: Update, result, data: dict):
+        """Post-process each update to record and analyze response time."""
+        if "process_start_time" in data:
+            process_time = time.time() - data["process_start_time"]
+            self.response_times.append(process_time)
+            
+            # If response time is unusually high, log it
+            if process_time > 5.0:  # More than 5 seconds to process
+                self.loggers["performance"].warning(
+                    f"Slow response time: {process_time:.2f}s for update {update.update_id}"
+                )
+                
+            # Update bot status
+            if not self.is_responding and process_time < 5.0:
+                self.is_responding = True
+                self.loggers["status"].info("Bot has resumed normal operation")
+                
+    def start_watchdog(self):
+        """Start the watchdog timer to monitor bot health."""
+        async def watchdog_check():
+            while True:
+                try:
+                    # Check if the bot has been inactive for too long
+                    if time.time() - self.last_activity > 300:  # 5 minutes
+                        # Check bot responsiveness with getMe() call
+                        try:
+                            await asyncio.wait_for(self.bot.get_me(), timeout=5.0)
+                            # If we get here, bot is responding
+                            if not self.is_responding:
+                                self.is_responding = True
+                                self.loggers["status"].info("Bot has recovered and is now responsive")
+                        except (TimeoutError, asyncio.TimeoutError):
+                            # Bot is not responding
+                            if self.is_responding:
+                                self.is_responding = False
+                                self.loggers["status"].error("Bot appears to be unresponsive")
+                                # Notify admins
+                                for admin_id in self.admin_ids:
+                                    try:
+                                        await self.bot.send_message(
+                                            chat_id=admin_id,
+                                            text=f"{EMOJI['alert']} *ALERT:* Bot appears to be unresponsive. Please check logs.",
+                                            parse_mode=ParseMode.MARKDOWN
+                                        )
+                                    except Exception as e:
+                                        self.loggers["errors"].error(f"Failed to notify admin {admin_id}: {e}")
+                    
+                    # Sleep for 1 minute before next check
+                    await asyncio.sleep(60)
+                except Exception as e:
+                    self.loggers["errors"].error(f"Error in watchdog timer: {e}")
+                    await asyncio.sleep(60)  # Sleep and retry
+        
+        # Start the watchdog coroutine
+        self.watchdog_timer = asyncio.create_task(watchdog_check())
+
+class ActivityTrackerMiddleware:
+    """Middleware to track user activity timestamps."""
+    
+    async def on_pre_process_update(self, update: Update, data: dict):
+        """Record user activity time for every update."""
+        if update and update.effective_user:
+            user_id = update.effective_user.id
+            context = data.get('application_context')
+            
+            if context and hasattr(context, 'user_data'):
+                # Update the last activity time
+                context.user_data['last_activity_time'] = time.time()
+
+async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler for restarting the conversation when the user clicks the restart button.
+    
+    Args:
+        update: Telegram update
+        context: Context with user data
+    """
+    query = update.callback_query
+    if query:
+        await query.answer()
+    
+    # Clear user data
+    context.user_data.clear()
+    
+    # Send a restart message
+    if query:
+        await query.edit_message_text(
+            f"{EMOJI['restart']} *Conversation Restarted*\n\n"
+            f"Your session has been reset and you can start fresh. "
+            f"Use the menu below to continue.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
+                [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
+                [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
+            ])
+        )
+    else:
+        # For command-based restart
+        await update.message.reply_text(
+            f"{EMOJI['restart']} *Conversation Restarted*\n\n"
+            f"Your session has been reset and you can start fresh. "
+            f"Use the menu below to continue.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
+                [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
+                [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
+            ])
+        )
+    
+    return ConversationHandler.END
+
+async def get_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler for providing help when the user clicks the help button.
+    
+    Args:
+        update: Telegram update
+        context: Context with user data
+    """
+    query = update.callback_query
+    if query:
+        await query.answer()
+    
+    help_message = (
+        f"{EMOJI['help']} *Need Help?*\n\n"
+        f"Here are some common commands:\n\n"
+        f"• /start - Start or restart the bot\n"
+        f"• /reset - Reset your conversation if something goes wrong\n"
+        f"• /help - Show this help message\n"
+        f"• /contact - Contact customer support\n"
+        f"• /faq - Frequently asked questions\n\n"
+        f"*Having Issues?*\n"
+        f"If the bot isn't responding properly, you can:\n"
+        f"1. Try the /reset command\n"
+        f"2. Wait a few minutes and try again\n"
+        f"3. Contact our support team at support@ganjaparaiso.com\n\n"
+        f"Thank you for your patience!"
+    )
+    
+    if query:
+        await query.edit_message_text(
+            help_message,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Bot", callback_data="restart_conversation")],
+                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+            ])
+        )
+    else:
+        await update.message.reply_text(
+            help_message,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Bot", callback_data="restart_conversation")],
+                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+            ])
+        )
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Command handler for /reset to allow users to manually reset their conversation.
+    
+    Args:
+        update: Telegram update
+        context: Context with user data
+    """
+    # Clear user data
+    context.user_data.clear()
+    
+    await update.message.reply_text(
+        f"{EMOJI['restart']} *Conversation Reset*\n\n"
+        f"I've reset your session. Everything should be working properly now.\n"
+        f"What would you like to do next?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
+            [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
+            [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
+        ])
+    )
+    
+    return ConversationHandler.END
+
+async def check_conversation_status(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job to check if conversations have been idle for too long and offer recovery.
+    This runs periodically to check for stuck conversations.
+    
+    Args:
+        context: Application context containing bot data
+    """
+    now = time.time()
+    bot = context.bot
+    
+    # Get all active conversations that might have stalled
+    for user_id, user_data in context.application.user_data.items():
+        # Check if this user has been inactive for more than 10 minutes
+        last_activity = user_data.get('last_activity_time', 0)
+        
+        if last_activity and now - last_activity > 600:  # 10 minutes
+            # This user's conversation may be stalled
+            try:
+                # Only send recovery message if we haven't sent one recently
+                if now - user_data.get('last_recovery_sent', 0) > 1800:  # 30 minutes
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"{EMOJI['clock']} *Are you still there?*\n\n"
+                            f"I noticed that our conversation has been inactive for a while. "
+                            f"If you were in the middle of something and the bot stopped responding, "
+                            f"you can restart our conversation using the buttons below."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
+                            [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+                        ])
+                    )
+                    
+                    # Update the recovery sent time
+                    user_data['last_recovery_sent'] = now
+            except Exception as e:
+                loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
+
+class ActivityTrackerMiddleware:
+    """Middleware to track user activity timestamps."""
+    
+    async def on_pre_process_update(self, update: Update, data: dict):
+        """Record user activity time for every update."""
+        if update and update.effective_user:
+            user_id = update.effective_user.id
+            context = data.get('application_context')
+            
+            if context and hasattr(context, 'user_data'):
+                # Update the last activity time
+                context.user_data['last_activity_time'] = time.time()
+
+class ConversationTimeout(Exception):
+    """Exception raised when a conversation times out."""
+    pass
 # ---------------------------- Convenience Functions ----------------------------
 # These wrapper functions make it easier to pass our dependencies to handlers
 async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3789,6 +4941,24 @@ async def handle_back_navigation_wrapper(update: Update, context: ContextTypes.D
 
 async def back_to_categories_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await back_to_categories(update, context, inventory_manager, loggers)
+
+async def back_to_categories_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await back_to_categories(update, context, inventory_manager, loggers)
+
+async def search_order_prompt_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await search_order_prompt(update, context)
+
+async def handle_admin_search_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await handle_admin_search(update, context, google_apis, loggers)
+
+async def review_payments_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await review_payments(update, context, google_apis, loggers)
+
+async def review_specific_payment_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await review_specific_payment(update, context, google_apis, loggers, order_manager)
+
+async def process_payment_action_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await process_payment_action(update, context, order_manager, loggers)
 # ---------------------------- Bot Setup ----------------------------
 def main():
     """Set up the bot and start polling."""
@@ -3803,7 +4973,7 @@ def main():
         loggers["errors"].error("No bot token found in configuration")
         print("Error: No bot token found. Please set the TELEGRAM_BOT_TOKEN environment variable.")
         sys.exit(1)
-    
+
     # Create persistence object to save conversation states
     persistence = PicklePersistence(filepath="bot_persistence")
     
@@ -3817,6 +4987,49 @@ def main():
     google_apis = GoogleAPIsManager(loggers)
     inventory_manager = InventoryManager(google_apis, loggers)
     order_manager = OrderManager(google_apis, loggers)
+
+    # Set up the application with persistence
+    persistence = PicklePersistence(filepath="bot_data.pickle")
+    application = Application.builder().token(TOKEN).persistence(persistence).build()
+    
+    # Add health check and activity tracking middleware
+    application.add_handler(
+        TypeHandler(Update, lambda update, context: HealthCheckMiddleware(application.bot, ADMIN_ID, loggers).on_pre_process_update(update, context)),
+        group=-3
+    )
+    application.add_handler(
+        TypeHandler(Update, lambda update, context: ActivityTrackerMiddleware().on_pre_process_update(update, context)), 
+        group=-2
+    )
+    
+    # Set up enhanced error handler
+    application.add_error_handler(enhanced_error_handler)
+    
+    # Add recovery command handlers
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
+    application.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
+    
+    # Schedule periodic checks for stuck conversations
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
+
+    # Admin search conversation handler
+    admin_search_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(search_order_prompt_wrapper, pattern="^search_order$")],
+        states={
+            ADMIN_SEARCH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_search_wrapper)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_to_admin_wrapper, pattern="^back_to_admin$")
+        ],
+        name="admin_search_conversation",
+        persistent=True,
+        conversation_timeout=300  # 5 minutes timeout
+    )
     
     # Set up conversation handler for main ordering flow
     conversation_handler = ConversationHandler(
@@ -3855,6 +5068,7 @@ def main():
     },
     fallbacks=[
         CommandHandler("cancel", cancel),
+        CommandHandler("categories", back_to_categories_wrapper),
     ],
     name="ordering_conversation",
     persistent=True,
@@ -3902,12 +5116,17 @@ def main():
     app.add_handler(CallbackQueryHandler(set_order_status_wrapper, pattern="^set_status_"))
     app.add_handler(CallbackQueryHandler(skip_tracking_link_wrapper, pattern="^skip_tracking_link$"))
     app.add_handler(CallbackQueryHandler(add_tracking_link_wrapper, pattern="^add_tracking_link$"))
+    app.add_handler(admin_search_handler)
+    app.add_handler(CallbackQueryHandler(review_payments_wrapper, pattern="^approve_payments$"))
+    app.add_handler(CallbackQueryHandler(review_specific_payment_wrapper, pattern="^review_payment_"))
+    app.add_handler(CallbackQueryHandler(process_payment_action_wrapper, pattern="^approve_payment_|^reject_payment_"))
     
     # Add the main conversation handlers
     app.add_error_handler(error_handler)
     app.add_handler(admin_tracking_handler)
     app.add_handler(tracking_handler)
     app.add_handler(conversation_handler)
+    app.add_handler(CommandHandler("categories", back_to_categories_wrapper))
     
     # Log the startup
     loggers["main"].info("Bot is running...")
