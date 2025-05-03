@@ -226,7 +226,7 @@ MESSAGES = {
     f"{EMOJI['money']} Send payment to GCash: {{}}\n\n"
     f"{EMOJI['qrcode']} Scan this QR code for faster payment:\n"
     f"[QR Code will appear here]\n\n"
-    f"{EMOJI['info']}<b>Note: If you're using the desktop app of Telegram, please select "
+    f"{EMOJI['info']} <b>Note: If you're using the desktop app of Telegram, please select "
     "the option to compress the image when uploading or pasting your payment screenshot.</b>\n\n"
     f"{EMOJI['success']} We will review your payment and proceed with processing your order."
     ),
@@ -340,7 +340,7 @@ SHEET_COLUMN_INDICES = {name: idx+1 for idx, name in enumerate(SHEET_HEADERS)}
 
 # ---------------------------- Regular Expressions ----------------------------
 REGEX = {
-    "shipping_details": r"^(?P<n>[\w\s\.]+)\s*/\s*(?P<address>[\w\s,\.\-\#\/]+)\s*/\s*(?P<contact>\+?[\d\s\-]{10,15})$",
+    "shipping_details": r"^(.+?)\s*\/\s*(.+?)\s*\/\s*(\+?[\d\s\-]{10,15})$",
     "quantity": r"(\d+)"
 }
 
@@ -1113,59 +1113,51 @@ def validate_quantity(text, category=None):
 
 def validate_shipping_details(text):
     """
-    Validate shipping details format with enhanced debugging.
+    Validate shipping details format with enhanced flexibility.
+    
+    This function checks if the user's shipping details input follows the correct format,
+    while allowing for more flexibility in names, addresses and contact information.
     
     Args:
-        text (str): Shipping details text
+        text (str): Shipping details text in format "Name / Address / Contact"
         
     Returns:
         tuple: (is_valid, result_dict_or_error_message)
     """
-    # Basic format check
+    # Log the input for debugging
+    logging.debug(f"Validating shipping details: {text}")
+    
+    # Basic format check - need two slashes to have three parts
     if text.count('/') != 2:
         return False, "Invalid format. Need exactly two '/' separators. Format: Name / Address / Contact"
     
-    # Try with standard pattern first
-    pattern = REGEX["shipping_details"]
-    match = re.match(pattern, text)
+    # Split the text by slashes and trim whitespace
+    parts = [part.strip() for part in text.split('/')]
     
-    if not match:
-        # Split manually to provide better error message
-        parts = [part.strip() for part in text.split('/')]
-        if len(parts) != 3:
-            return False, "Invalid format. Use: Name / Address / Contact"
-            
-        name, address, contact = parts
+    # Ensure we have three parts
+    if len(parts) != 3:
+        return False, "Invalid format. Use: Name / Address / Contact"
         
-        # Check each part
-        if not name:
-            return False, "Name cannot be empty. Format: Name / Address / Contact"
-        if not address:
-            return False, "Address cannot be empty. Format: Name / Address / Contact"
-            
-        # Contact validation
-        contact_pattern = r"^\+?[\d\s\-]{10,15}$"
-        if not re.match(contact_pattern, contact):
-            return False, "Invalid contact number. Must be 10-15 digits, can include +, spaces, or hyphens."
-        
-        # If we get this far, manual parsing worked but regex failed - let's use manual results
-        return True, {
-            "name": sanitize_input(name, 50),
-            "address": sanitize_input(address, 100),
-            "contact": sanitize_input(contact, 15)
-        }
+    name, address, contact = parts
     
-    # Extract the matched groups
-    groups = match.groupdict()
+    # Check each part
+    if not name:
+        return False, "Name cannot be empty. Format: Name / Address / Contact"
+    if not address:
+        return False, "Address cannot be empty. Format: Name / Address / Contact"
+        
+    # Simplified contact validation - just ensure it has enough digits
+    # Count only digits
+    digit_count = sum(c.isdigit() for c in contact)
+    if digit_count < 10 or digit_count > 15:
+        return False, "Invalid contact number. Must have 10-15 digits. Can include +, spaces, or hyphens."
     
     # Sanitize the inputs
-    name = sanitize_input(groups.get("name", ""), 50)
-    address = sanitize_input(groups.get("address", ""), 100)
-    contact = sanitize_input(groups.get("contact", ""), 15)
+    name = sanitize_input(name, 50)
+    address = sanitize_input(address, 100)
+    contact = sanitize_input(contact, 15)
     
-    if not name or not address or not contact:
-        return False, "Name, address, and contact are all required."
-    
+    # Success - return the validated details
     return True, {
         "name": name,
         "address": address,
@@ -2663,6 +2655,9 @@ async def input_details(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
     """
     Handle shipping details input.
     
+    This function processes the user's shipping details input, validates it,
+    and moves to the confirmation step if valid.
+    
     Args:
         update: Telegram update
         context: Conversation context
@@ -2673,15 +2668,27 @@ async def input_details(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
     """
     user = update.message.from_user
     details_text = update.message.text
+
+    # Log the received input for debugging
+    loggers["main"].info(f"User {user.id} entered shipping details: {details_text}")
     
     # Validate shipping details
     is_valid, result = validate_shipping_details(details_text)
     
     if not is_valid:
-        await update.message.reply_text(MESSAGES["invalid_details"])
+        # Log the validation failure
+        loggers["main"].warning(f"Invalid shipping details from user {user.id}: {result}")
+        
+        # Send a detailed error message
+        await update.message.reply_text(
+            f"{EMOJI['error']} {result}\n\n"
+            f"{EMOJI['info']} Please use this format:\n"
+            f"Name / Address / Contact Number\n\n"
+            f"{EMOJI['success']} Example: Juan Dela Cruz / 123 Main St, City / 09171234567"
+        )
         return DETAILS
     
-    # Store the details
+    # Store the validated details
     context.user_data["shipping_details"] = details_text
     context.user_data["name"] = result["name"]
     context.user_data["address"] = result["address"]
@@ -2771,9 +2778,10 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
         # Send summary to admin
         await context.bot.send_message(admin_id, summary)
         
-        # First send payment text
+        # First send payment text with HTML parsing explicitly enabled
         await query.edit_message_text(
-            MESSAGES["payment_instructions"].format(GCASH_NUMBER)
+            MESSAGES["payment_instructions"].format(GCASH_NUMBER),
+            parse_mode=ParseMode.HTML  # Explicitly set HTML parse mode
         )
         
         # Then send the QR code
@@ -2793,7 +2801,7 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
     elif query.data == 'edit_details':
         await query.edit_message_text(MESSAGES["checkout_prompt"])
         return DETAILS
-
+    
 # ---------------------------- Payment & Tracking Handlers ----------------------------
 async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Wrapper for the track_order function that handles the initial /track command."""
@@ -3037,26 +3045,40 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get the order ID from context (if set by a previous step)
     order_id = context.user_data.get('track_order_id')
     
+    # Determine if this is a callback query or a direct message
+    is_callback = update.callback_query is not None
+    
     # If no order ID is set, prompt the user to enter one
     if not order_id:
-        await update.message.reply_text(
-            f"{EMOJI['search']} Please enter your Order ID to track its status:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-            ])
-        )
+        if is_callback:
+            await update.callback_query.edit_message_text(
+                f"{EMOJI['search']} Please enter your Order ID to track its status:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                f"{EMOJI['search']} Please enter your Order ID to track its status:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+                ])
+            )
         return TRACK_ORDER
     
     try:
         # Initialize sheets
         sheet, _ = await google_apis.initialize_sheets()
         if not sheet:
-            await update.message.reply_text(
-                ERRORS["sheet_init_failed"],
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-                ])
-            )
+            error_message = f"{EMOJI['error']} Failed to access order data. Please try again later."
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
+            
+            if is_callback:
+                await update.callback_query.edit_message_text(error_message, reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(error_message, reply_markup=reply_markup)
             return ConversationHandler.END
         
         # Get orders
@@ -3070,12 +3092,16 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
         
         if not found_order:
-            await update.message.reply_text(
-                MESSAGES["order_not_found"].format(order_id),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-                ])
-            )
+            error_message = MESSAGES["order_not_found"].format(order_id)
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+            ])
+            
+            if is_callback:
+                await update.callback_query.edit_message_text(error_message, reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(error_message, reply_markup=reply_markup)
+            
             context.user_data.pop('track_order_id', None)
             return ConversationHandler.END
         
@@ -3182,33 +3208,55 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Use a try-except block for sending the message to handle potential errors
         try:
-            await update.message.reply_text(
-                message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                disable_web_page_preview=True
-            )
+            if is_callback:
+                await update.callback_query.edit_message_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    disable_web_page_preview=True
+                )
+            else:
+                await update.message.reply_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    disable_web_page_preview=True
+                )
         except TelegramError as e:
             loggers["errors"].error(f"Failed to send tracking info to user {update.effective_user.id}: {e}")
             # Send a simpler fallback message
             try:
-                await update.message.reply_text(
-                    f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
-                )
+                if is_callback:
+                    await update.callback_query.edit_message_text(
+                        f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"Order {order_id} status: {status}. There was an error displaying the full tracking information.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Try Again", callback_data=f"refresh_tracking_{order_id}")]])
+                    )
             except:
                 pass  # Last resort - at least we logged the error
         
         return ConversationHandler.END
         
     except Exception as e:
+        error_message = f"{EMOJI['error']} An error occurred while tracking your order: {str(e)}"
         loggers["errors"].error(f"Error in track_order: {e}")
-        await update.message.reply_text(
-            f"{EMOJI['error']} An error occurred while tracking your order. Please try again later.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-            ])
-        )
+        
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
+        ])
+        
+        try:
+            if is_callback:
+                await update.callback_query.edit_message_text(error_message, reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(error_message, reply_markup=reply_markup)
+        except Exception as send_error:
+            loggers["errors"].error(f"Failed to send error message: {send_error}")
+            
         return ConversationHandler.END
 
 async def get_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3256,8 +3304,9 @@ async def refresh_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Store the order ID in context
     context.user_data['track_order_id'] = order_id
     
-    # Call track_order to display updated status
-    return await track_order(update.get_callback_query(), context)
+    # Call track_order with the proper update
+    # Create a wrapper function that handles this properly
+    return await track_order(update, context)
 
 async def handle_order_tracking(
     update: Update, context: ContextTypes.DEFAULT_TYPE, 
@@ -3790,42 +3839,6 @@ class AdminPanel:
                 ])
             )
     
-    async def command_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Handle unrecognized commands with a helpful response.
-    
-        Args:
-            update: Telegram update
-            context: Conversation context
-        """
-        command = update.message.text
-        user_id = update.effective_user.id
-    
-        # Log the unrecognized command
-        loggers["main"].info(f"User {user_id} entered unrecognized command: {command}")
-    
-        # Create a helpful message with available commands
-        available_commands = (
-            f"{EMOJI['info']} **Available Commands:**\n\n"
-            f"• /start - Start ordering\n"
-            f"• /track - Track your order\n"
-            f"• /categories - Browse categories\n"
-            f"• /reset - Reset the conversation\n"
-            f"• /help - Show this help message\n"
-            f"• /support - Contact support\n\n"
-            f"{EMOJI['question']} Need assistance? Use /support to get help."
-        )
-    
-        # Send a friendly message with command suggestions
-        await update.message.reply_text(
-            f"{EMOJI['question']} I don't recognize the command '{command}'.\n\n{available_commands}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['browse']} Start Shopping", callback_data="start_shopping")],
-                [InlineKeyboardButton(f"{EMOJI['tracking']} Track Order", callback_data="track_order")]
-            ])
-        )
-
     async def add_tracking_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Handle adding or updating tracking link.
@@ -4320,7 +4333,7 @@ class HealthCheckMiddleware:
     
     def __init__(self, bot, admin_ids, loggers):
         self.bot = bot
-        self.admin_ids = admin_ids
+        self.admin_ids = admin_ids if isinstance(admin_ids, list) else [admin_ids]
         self.loggers = loggers
         self.response_times = deque(maxlen=100)  # Track the last 100 response times
         self.is_responding = True
@@ -4330,6 +4343,7 @@ class HealthCheckMiddleware:
     
     async def on_pre_process_update(self, update: Update, data: dict):
         """Pre-process each update to record the start time."""
+        # Store the start time in the data dictionary
         data["process_start_time"] = time.time()
         self.last_activity = time.time()
         
@@ -4396,10 +4410,13 @@ class ActivityTrackerMiddleware:
         """Record user activity time for every update."""
         if update and update.effective_user:
             user_id = update.effective_user.id
+            
+            # Get the application context safely
             context = data.get('application_context')
             
+            # Only proceed if we have a valid context with user_data
             if context and hasattr(context, 'user_data'):
-                # Update the last activity time
+                # Update the last activity time in user_data
                 context.user_data['last_activity_time'] = time.time()
 
 class ConversationTimeout(Exception):
@@ -4419,11 +4436,11 @@ async def error_handler(update, context):
     log_error(loggers["errors"], "error_handler", context.error)
     
     # Notify user if possible
-    if update and update.effective_user:
+    if update and update.effective_chat and update.effective_chat.id:
         try:
             await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=ERRORS["error"]
+                chat_id=update.effective_chat.id,
+                text=MESSAGES["error"]
             )
         except Exception as error:
             loggers["errors"].error(f"Failed to send error message to the user: {error}")
@@ -4458,29 +4475,25 @@ async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         loggers["errors"].error(f"Error retrieving user/chat information: {e}")
     
-    # Check if this error was already processed (prevents duplicate notifications)
+    # Generate an error key to track this specific error
     error_key = f"{chat_id}:{message_id}" if chat_id and message_id else str(error)
     
-    # Initialize processed_errors set if it doesn't exist
+    # Initialize the processed_errors set in bot_data if it doesn't exist
     if not hasattr(context.bot_data, "processed_errors"):
         context.bot_data["processed_errors"] = set()
     
-    # Skip if already processed this error
+    # If this error is already being processed, return to avoid duplicate handling
     if error_key in context.bot_data["processed_errors"]:
         return
     
-    # Mark this error as processed
+    # Add this error to the processed set
     context.bot_data["processed_errors"].add(error_key)
     
-    # Clean up processed errors periodically (keep only recent ones)
+    # Clean up processed errors periodically
     if len(context.bot_data["processed_errors"]) > 100:
-        # Remove oldest items to keep set size manageable
-        try:
-            for _ in range(50):  # Remove 50 oldest items
-                context.bot_data["processed_errors"].pop()
-        except KeyError:
-            # Set might be empty, just ignore
-            pass
+        # Convert to list, keep only the 50 most recent items
+        old_errors = list(context.bot_data["processed_errors"])
+        context.bot_data["processed_errors"] = set(old_errors[-50:])
     
     # Log the error details
     error_text = f"User: {user_id} | Chat: {chat_id} | Error: {type(error).__name__}: {error}"
@@ -4607,35 +4620,37 @@ async def check_conversation_status(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     bot = context.bot
     
-    # Get all active conversations that might have stalled
-    for user_id, user_data in context.application.user_data.items():
-        # Check if this user has been inactive for more than 10 minutes
-        last_activity = user_data.get('last_activity_time', 0)
-        
-        if last_activity and now - last_activity > 600:  # 10 minutes
-            # This user's conversation may be stalled
-            try:
-                # Only send recovery message if we haven't sent one recently
-                if now - user_data.get('last_recovery_sent', 0) > 1800:  # 30 minutes
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=(
-                            f"{EMOJI['clock']} *Are you still there?*\n\n"
-                            f"I noticed that our conversation has been inactive for a while. "
-                            f"If you were in the middle of something and the bot stopped responding, "
-                            f"you can restart our conversation using the buttons below."
-                        ),
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
-                            [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
-                        ])
-                    )
-                    
-                    # Update the recovery sent time
-                    user_data['last_recovery_sent'] = now
-            except Exception as e:
-                loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
+    # Safely iterate through user data
+    if hasattr(context.application, 'user_data'):
+        for user_id, user_data in context.application.user_data.items():
+            # Check if this user has been inactive for more than 10 minutes
+            last_activity = user_data.get('last_activity_time', 0)
+            
+            if last_activity and now - last_activity > 600:  # 10 minutes
+                # This user's conversation may be stalled
+                try:
+                    # Only send recovery message if we haven't sent one recently
+                    last_recovery_sent = user_data.get('last_recovery_sent', 0)
+                    if now - last_recovery_sent > 1800:  # 30 minutes
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                f"{EMOJI['clock']} *Are you still there?*\n\n"
+                                f"I noticed that our conversation has been inactive for a while. "
+                                f"If you were in the middle of something and the bot stopped responding, "
+                                f"you can restart our conversation using the buttons below."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Conversation", callback_data="restart_conversation")],
+                                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+                            ])
+                        )
+                        
+                        # Update the recovery sent time
+                        user_data['last_recovery_sent'] = now
+                except Exception as e:
+                    loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
 
 # ---------------------------- Bot Recovery & Support Functions ----------------------------
 async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4859,6 +4874,33 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(MESSAGES["cancel_order"])
     return ConversationHandler.END
 
+async def force_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Force restart any ongoing conversation and return to the start state.
+    
+    This command bypasses normal conversation flow and resets everything,
+    useful when users get stuck in a conversation state.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    # Clear user data
+    context.user_data.clear()
+    
+    # Send confirmation
+    await update.message.reply_text(
+        f"{EMOJI['restart']} Your conversation has been completely reset.\n\n"
+        f"Let's start fresh! What would you like to do?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
+            [InlineKeyboardButton(f"{EMOJI['tracking']} Track Order", callback_data="track_order")]
+        ])
+    )
+    
+    # End any conversation
+    return ConversationHandler.END
+
 async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle conversation timeout.
@@ -4879,6 +4921,45 @@ async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=ERRORS["timeout"]
     )
     return ConversationHandler.END
+
+async def command_not_found(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle unrecognized commands with a helpful response.
+    
+    This function provides users with information about available commands
+    when they enter a command that isn't recognized by the bot.
+    
+    Args:
+        update: Telegram update containing message info
+        context: Conversation context for user data
+    """
+    command = update.message.text
+    user_id = update.effective_user.id
+    
+    # Log the unrecognized command
+    loggers["main"].info(f"User {user_id} entered unrecognized command: {command}")
+    
+    # Create a helpful message with available commands
+    available_commands = (
+        f"{EMOJI['info']} Available Commands:\n\n"
+        f"• /start - Start ordering\n"
+        f"• /track - Track your order\n"
+        f"• /categories - Browse categories\n"
+        f"• /reset - Reset the conversation\n"
+        f"• /help - Show this help message\n"
+        f"• /support - Contact support\n\n"
+        f"{EMOJI['question']} Need assistance? Use /support to get help."
+    )
+    
+    # Send a friendly message with command suggestions
+    await update.message.reply_text(
+        f"{EMOJI['question']} I don't recognize the command '{command}'.\n\n{available_commands}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{EMOJI['browse']} Start Shopping", callback_data="start_shopping")],
+            [InlineKeyboardButton(f"{EMOJI['tracking']} Track Order", callback_data="track_order")]
+        ])
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -5037,8 +5118,9 @@ def main():
     
     # Handle missing token
     if not TOKEN:
-        loggers["errors"].error("No bot token found in configuration")
-        print("Error: No bot token found. Please set the TELEGRAM_BOT_TOKEN environment variable.")
+        error_msg = "No bot token found in configuration"
+        loggers["errors"].error(error_msg)
+        print(f"Error: {error_msg}. Please set the TELEGRAM_BOT_TOKEN environment variable.")
         sys.exit(1)
 
     # Support multiple admin IDs
@@ -5051,186 +5133,193 @@ def main():
         admin_ids.append(ADMIN_ID)
     
     loggers["main"].info(f"Configured admin IDs: {admin_ids}")
-
+    
     # Create persistence object to save conversation states
     persistence = PicklePersistence(filepath="bot_persistence")
     
-    # Initialize application with persistence and concurrency
-    app = ApplicationBuilder().token(TOKEN).persistence(persistence).concurrent_updates(True).build()
-    
-    # Store start time
-    app.bot_data["start_time"] = time.time()
-    
-    # Initialize services
-    google_apis = GoogleAPIsManager(loggers)
-    inventory_manager = InventoryManager(google_apis, loggers)
-    order_manager = OrderManager(google_apis, loggers)
-    # Create admin panel with multiple admin IDs
-    admin_panel = AdminPanel(app.bot, admin_ids, google_apis, order_manager, loggers)
-    
-    # Add health check and activity tracking middleware
-    app.add_handler(
-        TypeHandler(Update, lambda update, context: HealthCheckMiddleware(app.bot, [ADMIN_ID], loggers).on_pre_process_update(update, context)),
-        group=-3
-    )
-    app.add_handler(
-        TypeHandler(Update, lambda update, context: ActivityTrackerMiddleware().on_pre_process_update(update, context)), 
-        group=-2
-    )
-    
-    # Set up enhanced error handler
-    app.add_error_handler(enhanced_error_handler)
-    
-    # Add recovery command handlers
-    app.add_handler(CommandHandler("reset", reset_command))
-    app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
-    app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
-    app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
-    app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
-    app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
-    app.add_handler(CommandHandler("support", support_command))
-    app.add_handler(CommandHandler("help", help_command))
-    
-    # Schedule periodic checks for stuck conversations
-    job_queue = app.job_queue
-    job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
+    try:
+        # Initialize application with persistence and concurrency
+        app = ApplicationBuilder().token(TOKEN).persistence(persistence).concurrent_updates(True).build()
+        
+        # Store start time
+        app.bot_data["start_time"] = time.time()
+        # Initialize processed errors set
+        app.bot_data["processed_errors"] = set()
+        
+        # Initialize services
+        google_apis = GoogleAPIsManager(loggers)
+        inventory_manager = InventoryManager(google_apis, loggers)
+        order_manager = OrderManager(google_apis, loggers)
+        
+        # Create admin panel with multiple admin IDs
+        admin_panel = AdminPanel(app.bot, admin_ids, google_apis, order_manager, loggers)
+        
+        # Set up error handlers
+        app.add_error_handler(enhanced_error_handler)
+        app.add_error_handler(error_handler)
+        
+        # Add recovery command handlers
+        app.add_handler(CommandHandler("reset", reset_command))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("support", support_command))
+        app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
+        app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
+        app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_"))
+        app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
+        app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
+        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_"))
+        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_"))
+        app.add_handler(CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$"))
+        app.add_handler(CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"))
+        app.add_handler(CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"))
 
-    # Admin search conversation handler
-    admin_search_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_panel.search_order_prompt, pattern="^search_order$")],
-        states={
-            ADMIN_SEARCH: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.handle_admin_search)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$")
-        ],
-        name="admin_search_conversation",
-        persistent=True,
-        conversation_timeout=300  # 5 minutes timeout
-    )
+        # Schedule periodic checks for stuck conversations
+        job_queue = app.job_queue
+        job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
     
-    # Set up conversation handler for main ordering flow
-    conversation_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start_wrapper)],
-        states={
-            CATEGORY: [
-                CallbackQueryHandler(choose_category_wrapper)
+        # Admin search conversation handler
+        admin_search_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(admin_panel.search_order_prompt, pattern="^search_order$")],
+            states={
+                ADMIN_SEARCH: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.handle_admin_search)
+                ],
+            },
+            fallbacks=[
+                CommandHandler("cancel", cancel),
+                CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$")
             ],
-            STRAIN_TYPE: [
-                CallbackQueryHandler(choose_strain_type_wrapper)
+            name="admin_search_conversation",
+            persistent=True,
+            conversation_timeout=300  # 5 minutes timeout
+        )
+        
+        # Set up conversation handler for main ordering flow
+        conversation_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", start_wrapper)],
+            states={
+                CATEGORY: [
+                    CallbackQueryHandler(choose_category_wrapper)
+                ],
+                STRAIN_TYPE: [
+                    CallbackQueryHandler(choose_strain_type_wrapper)
+                ],
+                BROWSE_BY: [
+                    CallbackQueryHandler(browse_carts_by_wrapper)
+                ],
+                PRODUCT_SELECTION: [
+                    CallbackQueryHandler(select_product_wrapper)
+                ],
+                QUANTITY: [
+                    CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_"),
+                    CallbackQueryHandler(handle_quantity_selection_wrapper, pattern="^qty_"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, input_quantity_wrapper)
+                ],
+                CONFIRM: [
+                    CallbackQueryHandler(confirm_order_wrapper)
+                ],
+                DETAILS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, input_details_wrapper)
+                ],
+                CONFIRM_DETAILS: [
+                    CallbackQueryHandler(confirm_details_wrapper)
+                ],
+                PAYMENT: [
+                    MessageHandler(filters.PHOTO, handle_payment_screenshot_wrapper),
+                    CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_")
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", cancel),
+                CommandHandler("categories", back_to_categories_wrapper),
             ],
-            BROWSE_BY: [
-                CallbackQueryHandler(browse_carts_by_wrapper)
-            ],
-            PRODUCT_SELECTION: [
-                CallbackQueryHandler(select_product_wrapper)
-            ],
-            QUANTITY: [
-                CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_"),
-                CallbackQueryHandler(handle_quantity_selection_wrapper, pattern="^qty_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, input_quantity_wrapper)
-            ],
-            CONFIRM: [
-                CallbackQueryHandler(confirm_order_wrapper)
-            ],
-            DETAILS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, input_details_wrapper)
-            ],
-            CONFIRM_DETAILS: [
-                CallbackQueryHandler(confirm_details_wrapper)
-            ],
-            PAYMENT: [
-                MessageHandler(filters.PHOTO, handle_payment_screenshot_wrapper),
-                CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_")
-            ]
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("categories", back_to_categories_wrapper),
-        ],
-        name="ordering_conversation",
-        persistent=True,
-        conversation_timeout=900  # 15 minutes timeout
-    )
+            name="ordering_conversation",
+            persistent=True,
+            conversation_timeout=900  # 15 minutes timeout
+        )
+        
+        # Order tracking conversation handler
+        tracking_handler = ConversationHandler(
+            entry_points=[CommandHandler("track", track_order_wrapper)],
+            states={
+                TRACK_ORDER: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, get_order_id),
+                    CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"),
+                    CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"),
+                    CallbackQueryHandler(select_order, pattern="^select_order_"),
+                    CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$")
+                ],
+                TRACKING: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_tracking_wrapper)f
+                ]
+                    },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            name="tracking_conversation",
+            persistent=True,
+            conversation_timeout=300  # 5 minutes timeout
+        )   
     
-    # Order tracking conversation handler
-    tracking_handler = ConversationHandler(
-        entry_points=[CommandHandler("track", track_order_wrapper)],
-        states={
-            TRACK_ORDER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, get_order_id),
-                CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"),
-                CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"),
-                CallbackQueryHandler(select_order, pattern="^select_order_"),
-                CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$")
+        # Admin tracking link input handler
+        admin_tracking_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_")],
+            states={
+                ADMIN_TRACKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.receive_tracking_link)]
+            },
+            fallbacks=[
+                CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"),
+                CommandHandler("cancel", cancel)
             ],
-            TRACKING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_tracking_wrapper)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        name="tracking_conversation",
-        persistent=True,
-        conversation_timeout=300  # 5 minutes timeout
-    )
+            name="admin_tracking_conversation",
+            persistent=True,
+            conversation_timeout=300  # 5 minutes timeout
+        )
+        
+        # Admin command handler - route to the admin panel class
+        app.add_handler(CommandHandler("admin", lambda update, context: admin_panel.show_panel(update, context)))
+        app.add_handler(CommandHandler("health", health_check))
+        
+        # Admin panel callback handlers
+        app.add_handler(CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.view_orders, pattern="^view_orders$"))
+        app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.view_orders(update, context), pattern="^filter_"))
+        app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.manage_order(update, context), pattern="^manage_order_"))
+        app.add_handler(CallbackQueryHandler(admin_panel.update_order_status, pattern="^update_status_"))
+        app.add_handler(CallbackQueryHandler(admin_panel.view_payment_screenshot, pattern="^view_payment_"))
+        app.add_handler(CallbackQueryHandler(admin_panel.set_order_status, pattern="^set_status_"))
+        app.add_handler(CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_link$"))
+        app.add_handler(admin_search_handler)
+        app.add_handler(CallbackQueryHandler(admin_panel.review_payments, pattern="^approve_payments$"))
+        app.add_handler(CallbackQueryHandler(admin_panel.review_specific_payment, pattern="^review_payment_"))
+        app.add_handler(CallbackQueryHandler(admin_panel.process_payment_action, pattern="^approve_payment_|^reject_payment_"))
+        
+        # Add force restart command
+        app.add_handler(CommandHandler("restart", force_restart))
 
-    # Admin tracking link input handler
-    admin_tracking_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_")],
-        states={
-            ADMIN_TRACKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.receive_tracking_link)]
-        },
-        fallbacks=[
-            CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"),
-            CommandHandler("cancel", cancel)
-        ],
-        name="admin_tracking_conversation",
-        persistent=True,
-        conversation_timeout=300  # 5 minutes timeout
-    )
+        # Register the main handlers
+        app.add_handler(admin_tracking_handler)
+        app.add_handler(tracking_handler)
+        app.add_handler(conversation_handler)
+        app.add_handler(CommandHandler("categories", back_to_categories_wrapper))
+        
+        # Register handler for unknown commands - must be added AFTER all other command handlers
+        unknown_command_handler = MessageHandler(
+            filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE, 
+            command_not_found
+        )
+        app.add_handler(unknown_command_handler)
     
-    # Admin command handler - route to the admin panel class
-    app.add_handler(CommandHandler("admin", lambda update, context: admin_panel.show_panel(update, context)))
-    app.add_handler(CommandHandler("health", health_check))
-    
-    # Admin panel callback handlers
-    app.add_handler(CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$"))
-    app.add_handler(CallbackQueryHandler(admin_panel.view_orders, pattern="^view_orders$"))
-    app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.view_orders(update, context), pattern="^filter_"))
-    app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.manage_order(update, context), pattern="^manage_order_"))
-    app.add_handler(CallbackQueryHandler(admin_panel.update_order_status, pattern="^update_status_"))
-    app.add_handler(CallbackQueryHandler(admin_panel.view_payment_screenshot, pattern="^view_payment_"))
-    app.add_handler(CallbackQueryHandler(admin_panel.set_order_status, pattern="^set_status_"))
-    app.add_handler(CallbackQueryHandler(admin_panel.skip_tracking_link, pattern="^skip_tracking_link$"))
-    app.add_handler(CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_link$"))
-    app.add_handler(admin_search_handler)
-    app.add_handler(CallbackQueryHandler(admin_panel.review_payments, pattern="^approve_payments$"))
-    app.add_handler(CallbackQueryHandler(admin_panel.review_specific_payment, pattern="^review_payment_"))
-    app.add_handler(CallbackQueryHandler(admin_panel.process_payment_action, pattern="^approve_payment_|^reject_payment_"))
-    
-    # Register the main handlers
-    app.add_error_handler(error_handler)
-    app.add_handler(admin_tracking_handler)
-    app.add_handler(tracking_handler)
-    app.add_handler(conversation_handler)
-    app.add_handler(CommandHandler("categories", back_to_categories_wrapper))
-    
-    # Register handler for unknown commands - must be added AFTER all other command handlers
-    unknown_command_handler = MessageHandler(
-        filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE, 
-        command_not_found
-    )
-    app.add_handler(unknown_command_handler)
-
-    # Log the startup
-    loggers["main"].info("Bot is running...")
-    print("Bot is running...")
-    
-    # Start the bot
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Log the startup
+        loggers["main"].info("Bot is running...")
+        print("Bot is running...")
+        
+        # Start the bot
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        loggers["errors"].critical(f"Critical error starting bot: {type(e).__name__}: {e}")
+        print(f"Critical error: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
