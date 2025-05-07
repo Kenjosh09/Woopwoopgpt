@@ -1400,22 +1400,51 @@ class InventoryManager:
     async def category_has_products(self, category):
         """
         Check if a category has any products in stock.
-        
+        Enhanced with better error handling and debugging.
+    
         Args:
             category (str): Product category key
-            
+        
         Returns:
             bool: True if category has products in stock, False otherwise
         """
-        if category not in PRODUCTS:
-            return False
+        try:
+            if category not in PRODUCTS:
+                return False
             
-        tag = PRODUCTS[category].get("tag")
-        if not tag:
-            return False
+            tag = PRODUCTS[category].get("tag")
+            if not tag:
+                return False
+        
+            # Special logging for buds category
+            if category == "buds":
+                print(f"DEBUG: Checking inventory for Premium Buds (tag: {tag})")
             
-        products_by_tag, _, _ = await self.get_inventory()
-        return len(products_by_tag.get(tag, [])) > 0
+            # Make a rate-limited request for inventory
+            products_by_tag, _, _ = await self.get_inventory()
+        
+            # For Premium Buds, do additional debugging
+            if category == "buds":
+                products_count = len(products_by_tag.get(tag, []))
+                print(f"DEBUG: Found {products_count} products for Premium Buds")
+            
+                # Check for at least one product in each strain type
+                has_indica = any(p.get("strain") == "indica" for p in products_by_tag.get(tag, []))
+                has_sativa = any(p.get("strain") == "sativa" for p in products_by_tag.get(tag, []))
+                has_hybrid = any(p.get("strain") == "hybrid" for p in products_by_tag.get(tag, []))
+            
+                print(f"DEBUG: Strain availability - Indica: {has_indica}, Sativa: {has_sativa}, Hybrid: {has_hybrid}")
+            
+            return len(products_by_tag.get(tag, [])) > 0
+        
+        except Exception as e:
+            # Log the error
+            self.loggers["errors"].error(f"Error checking products for {category}: {str(e)}")
+            print(f"DEBUG ERROR in category_has_products: {str(e)}")
+        
+            # Return True as a fallback to avoid breaking the flow
+            # This lets the user select the category even if we can't check inventory
+            return True
     
     async def calculate_price(self, category, product_key, quantity):
         """
@@ -1748,6 +1777,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_ma
 async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle category selection and determine next steps based on category.
+    Enhanced with additional debugging for Premium Buds selection.
     
     Args:
         update: Telegram update
@@ -1772,6 +1802,11 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     
     # Log the selection
     loggers["main"].info(f"User {query.from_user.id} selected category: {category}")
+    
+    # Extra debugging for Premium Buds selection
+    if category == "buds":
+        loggers["main"].info(f"User {query.from_user.id} selected Premium Buds, proceeding to strain selection")
+        print(f"DEBUG: Proceeding to strain selection for Premium Buds")
     
     # Get product details
     product = PRODUCTS.get(category)
@@ -1805,18 +1840,51 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     
     elif product.get("requires_strain_selection", False):
         # For products requiring strain selection (buds, edibles)
-        keyboard = [
-            [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
-            [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
-            [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
-            [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
-        ]
-        
-        await query.edit_message_text(
-            f"{product['emoji']} Please select the strain type for {product['name']}:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return STRAIN_TYPE
+        try:
+            # Log that we're entering strain selection for debugging
+            loggers["main"].info(f"Building strain selection keyboard for {category}")
+            print(f"DEBUG: Building strain selection keyboard for {category}")
+            
+            keyboard = [
+                [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
+                [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
+                [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
+                [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
+            ]
+            
+            # Log before sending the message
+            loggers["main"].info(f"Sending strain selection message for {category}")
+            print(f"DEBUG: Sending strain selection message")
+            
+            await query.edit_message_text(
+                f"{product['emoji']} Please select the strain type for {product['name']}:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+            # Log after sending the message
+            loggers["main"].info(f"Successfully displayed strain selection for {category}")
+            print(f"DEBUG: Successfully displayed strain selection")
+            
+            return STRAIN_TYPE
+            
+        except Exception as e:
+            # Log the error
+            error_msg = f"Error in strain selection for {category}: {str(e)}"
+            loggers["errors"].error(error_msg)
+            print(f"DEBUG ERROR: {error_msg}")
+            
+            # Notify the user and recover
+            try:
+                await query.edit_message_text(
+                    f"{EMOJI['error']} Sorry, there was an error displaying options. Please try again.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                    ])
+                )
+            except Exception as edit_error:
+                loggers["errors"].error(f"Failed to edit message after strain selection error: {str(edit_error)}")
+                
+            return CATEGORY
     
     # Default fallback
     await query.edit_message_text("This category is currently unavailable.")
@@ -1970,6 +2038,7 @@ async def back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle strain type selection for products that require it.
+    Enhanced with additional error handling and debugging.
     
     Args:
         update: Telegram update
@@ -1980,78 +2049,139 @@ async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
     Returns:
         int: Next conversation state
     """
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "back_to_categories":
-        # Go back to category selection
-        return await start(update, context, inventory_manager, loggers)
-    
-    # Store the selected strain type
-    strain_type = query.data
-    context.user_data["strain_type"] = strain_type
-    
-    # Get the category
-    category = context.user_data.get("category")
-    if not category:
-        # Something went wrong, go back to category selection
-        return await start(update, context, inventory_manager, loggers)
-    
-    # Log the selection
-    loggers["main"].info(
-        f"User {query.from_user.id} selected strain type: {strain_type} for {category}"
-    )
-    
-    # Fetch products of this strain type for the selected category
-    products_by_tag, products_by_strain, _ = await inventory_manager.get_inventory()
-    
-    # Get the tag for this category
-    tag = PRODUCTS[category].get("tag", "")
-    
-    # Filter products by tag and strain
-    filtered_products = []
-    for product in products_by_strain.get(strain_type, []):
-        if product.get("tag") == tag:
-            filtered_products.append(product)
-    
-    if not filtered_products:
-        # No products available, inform the user
-        await query.edit_message_text(
-            f"Sorry, no {strain_type} {category} are currently in stock. Please try another option.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Strain Selection", callback_data="back_to_strain")],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-            ])
-        )
-        return STRAIN_TYPE
-    
-    # Build product selection keyboard
-    keyboard = []
-    for product in filtered_products:
-        product_name = product.get("name")
-        product_price = product.get("price", 0)
-        product_key = product.get("key")
+    try:
+        query = update.callback_query
+        await query.answer()
         
-        button_text = f"{product_name} - ₱{product_price:,}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
-    
-    # Add back button
-    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_strain")])
-    
-    # For edibles, show products and then ask for quantity
-    if category == "edibles":
+        # Log for debugging
+        loggers["main"].info(f"Strain type selection callback received with data: {query.data}")
+        print(f"DEBUG: Strain type selection with data: {query.data}")
+        
+        if query.data == "back_to_categories":
+            # Go back to category selection
+            return await back_to_categories(update, context, inventory_manager, loggers)
+        
+        # Store the selected strain type
+        strain_type = query.data
+        context.user_data["strain_type"] = strain_type
+        
+        # Get the category
+        category = context.user_data.get("category")
+        if not category:
+            # Something went wrong, go back to category selection
+            loggers["errors"].error("Missing category in user data during strain selection")
+            return await back_to_categories(update, context, inventory_manager, loggers)
+        
+        # Log the selection
+        loggers["main"].info(
+            f"User {query.from_user.id} selected strain type: {strain_type} for {category}"
+        )
+        
+        # Fetch products of this strain type for the selected category
+        try:
+            print(f"DEBUG: Fetching inventory for {strain_type} strain")
+            products_by_tag, products_by_strain, _ = await inventory_manager.get_inventory()
+            
+            # Get the tag for this category
+            tag = PRODUCTS[category].get("tag", "")
+            print(f"DEBUG: Category {category} has tag {tag}")
+            
+            # Debug info about available products
+            print(f"DEBUG: Available strain types: {list(products_by_strain.keys())}")
+            print(f"DEBUG: Products for {strain_type}: {len(products_by_strain.get(strain_type, []))}")
+            
+            # Filter products by tag and strain
+            filtered_products = []
+            for product in products_by_strain.get(strain_type, []):
+                if product.get("tag") == tag:
+                    filtered_products.append(product)
+            
+            print(f"DEBUG: Filtered products count: {len(filtered_products)}")
+            
+        except Exception as e:
+            error_msg = f"Error fetching inventory in strain selection: {str(e)}"
+            loggers["errors"].error(error_msg)
+            print(f"DEBUG ERROR: {error_msg}")
+            
+            await query.edit_message_text(
+                f"{EMOJI['error']} Error fetching products. Please try again.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
+                ])
+            )
+            return CATEGORY
+        
+        if not filtered_products:
+            # No products available, inform the user
+            await query.edit_message_text(
+                f"Sorry, no {strain_type} {category} are currently in stock. Please try another option.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Strain Selection", callback_data="back_to_strain")],
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                ])
+            )
+            return STRAIN_TYPE
+        
+        # Build product selection keyboard
+        keyboard = []
+        for product in filtered_products:
+            product_name = product.get("name")
+            product_price = product.get("price", 0)
+            product_key = product.get("key")
+            
+            button_text = f"{product_name} - ₱{product_price:,}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
+        
+        # Add back button
+        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_strain")])
+        
+        # Debug before sending message
+        print(f"DEBUG: Sending product selection keyboard with {len(keyboard)-1} products")
+        
+        # For edibles, show products and then ask for quantity
+        if category == "edibles":
+            await query.edit_message_text(
+                f"{EMOJI['edibles']} Select an edible ({strain_type.capitalize()}):",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return PRODUCT_SELECTION
+        
+        # For buds, show products and then ask for quantity
         await query.edit_message_text(
-            f"{EMOJI['edibles']} Select an edible ({strain_type.capitalize()}):",
+            f"{EMOJI['buds']} Select a {strain_type.capitalize()} strain:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        
+        # Debug after sending message
+        print(f"DEBUG: Successfully sent product selection keyboard")
+        
         return PRODUCT_SELECTION
-    
-    # For buds, show products and then ask for quantity
-    await query.edit_message_text(
-        f"{EMOJI['buds']} Select a {strain_type.capitalize()} strain:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return PRODUCT_SELECTION
+        
+    except Exception as e:
+        # Log any uncaught exceptions
+        error_msg = f"Uncaught error in choose_strain_type: {str(e)}"
+        loggers["errors"].error(error_msg)
+        print(f"DEBUG ERROR: {error_msg}")
+        
+        try:
+            # Try to send a recovery message
+            await update.callback_query.edit_message_text(
+                f"{EMOJI['error']} Something went wrong. Please try again.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                ])
+            )
+        except Exception:
+            # If this fails too, try sending a new message
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"{EMOJI['error']} Something went wrong. Please use /start to try again."
+                )
+            except Exception:
+                pass  # We've tried our best
+        
+        return CATEGORY
 
 async def browse_carts_by(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
@@ -4762,33 +4892,28 @@ async def handle_start_shopping(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.MARKDOWN
         )
         
-        # Create a new update object with the chat_id and from_user from the callback query
-        # This is a workaround since we can't directly call start_wrapper with a callback query
-        message = Message(
-            message_id=query.message.message_id,
-            date=datetime.now(),
-            chat=query.message.chat,
-            from_user=query.from_user,
-            text="/start",
-            bot=context.bot,
-            entities=[],
-            caption_entities=[],
-            photo=[],
-            new_chat_members=[],
-            new_chat_photo=[],
-            delete_chat_photo=False,
-            group_chat_created=False,
-            supergroup_chat_created=False,
-            channel_chat_created=False,
-            message_auto_delete_timer_changed=None,
-            pinned_message=None
+        # Instead of creating a new update object, simply redirect to the categories selection
+        # This avoids the NoneType error by not trying to recreate the update object
+        available_categories = []
+        for category_id in PRODUCTS:
+            try:
+                has_products = await inventory_manager.category_has_products(category_id)
+                if has_products:
+                    available_categories.append(category_id)
+            except Exception as e:
+                loggers["errors"].error(f"Error checking products for {category_id}: {str(e)}")
+                # If there's an error, include the category anyway to avoid blocking the flow
+                available_categories.append(category_id)
+        
+        # Send the welcome message with categories
+        await query.edit_message_text(
+            MESSAGES["welcome"],
+            reply_markup=build_category_buttons(available_categories)
         )
         
-        # Create a new update with the message
-        new_update = Update(update_id=update.update_id, message=message)
+        # Return the category state to continue the conversation flow
+        return CATEGORY
         
-        # Call the start wrapper with the new update
-        return await start_wrapper(new_update, context)
     except Exception as e:
         # Log the error
         loggers["errors"].error(f"Error in handle_start_shopping: {str(e)}")
@@ -5403,6 +5528,61 @@ def main():
         # Schedule periodic checks for stuck conversations
         job_queue = app.job_queue
         job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
+
+        # Add this to your main() function after job_queue setup
+        async def timeout_recovery_job(context: ContextTypes.DEFAULT_TYPE):
+            """
+            Periodic job to detect and recover from stalled conversations.
+            Particularly focused on Premium Buds selection which may freeze.
+            """
+            now = time.time()
+            bot = context.bot
+    
+            # Safely iterate through user data
+            if hasattr(context.application, 'user_data'):
+                for user_id, user_data in context.application.user_data.items():
+                    try:
+                        # Check if this user has been inactive but in the middle of a Premium Buds flow
+                        last_activity = user_data.get('last_activity_time', 0)
+                        category = user_data.get('category')
+                        strain_type = user_data.get('strain_type')
+                
+                        # If user is in Premium Buds selection and inactive for more than 3 minutes
+                        if (category == "buds" and 
+                            now - last_activity > 180 and  # 3 minutes
+                            not user_data.get('recovery_sent_recently')):
+                    
+                            # Log the stalled conversation
+                            loggers["main"].warning(f"Detected stalled Premium Buds selection for user {user_id}")
+                            print(f"DEBUG: Sending recovery message for stalled Premium Buds selection to user {user_id}")
+                    
+                            # Mark as recently notified to prevent spam
+                            user_data['recovery_sent_recently'] = True
+                            user_data['recovery_sent_time'] = now
+                    
+                            # Send recovery message
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=(
+                                    f"{EMOJI['warning']} It looks like your Premium Buds selection may have stalled.\n\n"
+                                    f"This could be due to a temporary issue. Please try again by using one of the options below:"
+                                ),
+                                reply_markup=InlineKeyboardMarkup([
+                                    [InlineKeyboardButton(f"{EMOJI['restart']} Start Over", callback_data="restart_conversation")],
+                                    [InlineKeyboardButton(f"{EMOJI['browse']} Browse Categories", callback_data="back_to_categories")]
+                                ])
+                            )
+                    
+                        # Clean up old recovery flags (after 10 minutes)
+                        elif user_data.get('recovery_sent_recently') and now - user_data.get('recovery_sent_time', 0) > 600:
+                            user_data['recovery_sent_recently'] = False
+                    
+                    except Exception as e:
+                        loggers["errors"].error(f"Error in timeout recovery for user {user_id}: {str(e)}")
+                        continue  # Continue checking other users
+
+        # Add this line to your job_queue setup in main()
+        job_queue.run_repeating(timeout_recovery_job, interval=60, first=90)  # Run every minute, start after 90 seconds
     
         # Admin search conversation handler
         admin_search_handler = ConversationHandler(
