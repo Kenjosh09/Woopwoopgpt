@@ -18,7 +18,7 @@ import string
 from typing import Optional, Tuple, Dict, Any, List
 
 # Import Telegram components
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -4682,6 +4682,137 @@ async def check_conversation_status(context: ContextTypes.DEFAULT_TYPE):
                     loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
 
 # ---------------------------- Bot Recovery & Support Functions ----------------------------
+# Replace the restart_conversation function around line 4685
+
+# Global start command handler that works regardless of conversation state
+async def global_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Global start command that works regardless of conversation state.
+    
+    This handler ensures the /start command is always recognized and processed,
+    even if the user is in the middle of another conversation.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        
+    Returns:
+        int: Next conversation state from start_wrapper
+    """
+    # Log the global start command
+    user_id = update.effective_user.id if update.effective_user else "Unknown"
+    loggers["main"].info(f"Global start command triggered by user {user_id}")
+    
+    try:
+        # Clear user data to ensure fresh start
+        for key in list(context.user_data.keys()):
+            if key in context.user_data:
+                del context.user_data[key]
+        
+        # Call the regular start wrapper
+        return await start_wrapper(update, context)
+    except Exception as e:
+        # Log the error
+        loggers["errors"].error(f"Error in global_start: {str(e)}")
+        
+        # Send user-friendly error message
+        await update.message.reply_text(
+            f"{EMOJI['error']} Sorry, there was an error processing your /start command.\n\n"
+            f"Please try again in a moment or use /force_reset to clear your session.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['restart']} Reset Session", callback_data="restart_conversation")]
+            ])
+        )
+        return ConversationHandler.END
+    
+async def handle_start_shopping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler for the 'start_shopping' callback query.
+    Safely redirects users to the shopping flow.
+    
+    Args:
+        update: Telegram update with the callback query
+        context: Conversation context
+        
+    Returns:
+        int: Next conversation state
+    """
+    query = update.callback_query
+    if not query:
+        # This should never happen but we handle it just in case
+        loggers["errors"].error("handle_start_shopping called with update that has no callback_query")
+        return ConversationHandler.END
+    
+    # Answer the callback query to remove the "loading" state from the button
+    await query.answer()
+    
+    # Log the action
+    user_id = query.from_user.id if query.from_user else "Unknown"
+    loggers["main"].info(f"User {user_id} clicked start_shopping button")
+    
+    try:
+        # Clear user data to ensure a fresh start
+        for key in list(context.user_data.keys()):
+            if key in context.user_data:
+                del context.user_data[key]
+        
+        # Update the message to show we're starting
+        await query.edit_message_text(
+            f"{EMOJI['welcome']} Starting shopping experience...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Create a new update object with the chat_id and from_user from the callback query
+        # This is a workaround since we can't directly call start_wrapper with a callback query
+        message = Message(
+            message_id=query.message.message_id,
+            date=datetime.now(),
+            chat=query.message.chat,
+            from_user=query.from_user,
+            text="/start",
+            bot=context.bot,
+            entities=[],
+            caption_entities=[],
+            photo=[],
+            new_chat_members=[],
+            new_chat_photo=[],
+            delete_chat_photo=False,
+            group_chat_created=False,
+            supergroup_chat_created=False,
+            channel_chat_created=False,
+            message_auto_delete_timer_changed=None,
+            pinned_message=None
+        )
+        
+        # Create a new update with the message
+        new_update = Update(update_id=update.update_id, message=message)
+        
+        # Call the start wrapper with the new update
+        return await start_wrapper(new_update, context)
+    except Exception as e:
+        # Log the error
+        loggers["errors"].error(f"Error in handle_start_shopping: {str(e)}")
+        
+        # Inform the user
+        try:
+            await query.edit_message_text(
+                f"{EMOJI['error']} Sorry, there was an error starting the shopping experience.\n\n"
+                f"Please try using the /start command directly.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            # If we can't edit the message, try to send a new one
+            try:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"{EMOJI['error']} Sorry, there was an error. Please use /start to begin shopping.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass  # At this point, we've tried our best
+        
+        return ConversationHandler.END
+
 async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler for restarting the conversation when the user clicks the restart button.
@@ -4698,32 +4829,31 @@ async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data.clear()
     
     # Send a restart message
+    restart_message = f"{EMOJI['restart']} *Conversation Restarted*\n\n" \
+                      f"Your session has been reset and you can start fresh. " \
+                      f"Use the menu below to continue."
+    
+    reply_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
+        [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
+        [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
+    ])
+    
     if query:
         await query.edit_message_text(
-            f"{EMOJI['restart']} *Conversation Restarted*\n\n"
-            f"Your session has been reset and you can start fresh. "
-            f"Use the menu below to continue.",
+            restart_message,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
-                [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
-                [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
-            ])
+            reply_markup=reply_markup
         )
     else:
         # For command-based restart
         await update.message.reply_text(
-            f"{EMOJI['restart']} *Conversation Restarted*\n\n"
-            f"Your session has been reset and you can start fresh. "
-            f"Use the menu below to continue.",
+            restart_message,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
-                [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
-                [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
-            ])
+            reply_markup=reply_markup
         )
     
+    # Don't call start_wrapper directly, just return END to exit the conversation
     return ConversationHandler.END
 
 async def contact_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4880,6 +5010,41 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
     
+    return ConversationHandler.END
+
+async def force_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Force reset command that clears user data and ends any active conversation.
+    More powerful than the regular /reset command, as it forcibly ends any conversation.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    
+    Returns:
+        int: ConversationHandler.END to end any active conversation
+    """
+    user = update.effective_user
+    
+    # Log the force reset
+    loggers["main"].info(f"User {user.id} executed force_reset command")
+    
+    # Clear user data
+    context.user_data.clear()
+    
+    # Send confirmation with helpful next steps
+    await update.message.reply_text(
+        f"{EMOJI['restart']} Your session has been completely reset.\n\n"
+        f"This should resolve any issues with commands not being recognized.\n\n"
+        f"What would you like to do next?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{EMOJI['browse']} Start Shopping", callback_data="start_shopping")],
+            [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
+            [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
+        ])
+    )
+    
+    # End any active conversation
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5233,6 +5398,7 @@ def main():
         app.add_handler(CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$"))
         app.add_handler(CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"))
         app.add_handler(CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"))
+        app.add_handler(CallbackQueryHandler(handle_start_shopping, pattern="^start_shopping$"))
 
         # Schedule periodic checks for stuck conversations
         job_queue = app.job_queue
@@ -5300,6 +5466,9 @@ def main():
             conversation_timeout=900  # 15 minutes timeout
         )
         
+        # Register the global start handler
+        app.add_handler(CommandHandler("start", global_start, filters=~filters.UpdateType.EDITED_MESSAGE))
+
         # Order tracking conversation handler
         tracking_handler = ConversationHandler(
             entry_points=[CommandHandler("track", track_order_wrapper)],
@@ -5359,6 +5528,7 @@ def main():
         
         # Add force restart command
         app.add_handler(CommandHandler("restart", force_restart))
+        app.add_handler(CommandHandler("force_reset", force_reset_command))
 
         # This ensures the /start command is always accessible
         app.add_handler(CommandHandler("start", lambda update, context: (context.user_data.clear(), start_wrapper(update, context)),filters=~filters.UpdateType.EDITED_MESSAGE))
