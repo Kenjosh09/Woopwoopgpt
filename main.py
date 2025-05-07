@@ -63,7 +63,7 @@ if not TOKEN:
     
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "5167750837"))
 GCASH_NUMBER = os.getenv("GCASH_NUMBER", "09171234567")
-GCASH_QR_CODE_URL = os.getenv("GCASH_QR_CODE_URL", "https://example.com/gcash_qr.jpg")
+GCASH_QR_CODE_URL = os.getenv("GCASH_QR_CODE_URL", "https://drive.google.com/file/d/1kePOFyVimpLVnnp_-HEb3cihvIHJ2P4X/view?usp=drive_link")
 
 # Google API configuration
 GOOGLE_SHEET_NAME = "Telegram Orders"
