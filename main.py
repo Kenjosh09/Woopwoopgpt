@@ -5095,7 +5095,38 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------- Convenience Functions ----------------------------
 # These wrapper functions make it easier to pass our dependencies to handlers
 async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await start(update, context, inventory_manager, loggers)
+    """
+    Enhanced wrapper for the start command with error handling and conversation state clearing.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+        
+    Returns:
+        int: Next conversation state
+    """
+    try:
+        # Log the start command
+        user_id = update.effective_user.id
+        loggers["main"].info(f"User {user_id} issued /start command")
+        
+        # Clear any existing conversation state
+        return await start(update, context, inventory_manager, loggers)
+    except Exception as e:
+        # Log the error
+        user_id = update.effective_user.id if update.effective_user else "Unknown"
+        loggers["errors"].error(f"Error processing /start for user {user_id}: {str(e)}")
+        
+        # Send user-friendly error message
+        try:
+            await update.message.reply_text(
+                f"{EMOJI['error']} Sorry, there was an error processing your command.\n\n"
+                f"Please try again in a moment or contact support if the issue persists."
+            )
+        except Exception:
+            pass  # If we can't even send a message, don't crash
+        
+        return ConversationHandler.END
 
 async def choose_category_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await choose_category(update, context, inventory_manager, loggers)
@@ -5262,6 +5293,7 @@ def main():
             fallbacks=[
                 CommandHandler("cancel", cancel),
                 CommandHandler("categories", back_to_categories_wrapper),
+                CommandHandler("start", start_wrapper),
             ],
             name="ordering_conversation",
             persistent=True,
@@ -5327,6 +5359,9 @@ def main():
         
         # Add force restart command
         app.add_handler(CommandHandler("restart", force_restart))
+
+        # This ensures the /start command is always accessible
+        app.add_handler(CommandHandler("start", lambda update, context: (context.user_data.clear(), start_wrapper(update, context)),filters=~filters.UpdateType.EDITED_MESSAGE))
 
         # Register the main handlers
         app.add_handler(admin_tracking_handler)
