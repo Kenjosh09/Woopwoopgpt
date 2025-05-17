@@ -13,11 +13,21 @@ import re
 import shutil
 import sys
 import time
-from collections import defaultdict
+import string
+from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Tuple, Any, Union, Callable, cast
+
+# Handle optional dependencies
+PSUTIL_AVAILABLE = False
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    # psutil module not installed - system stats will be limited
+    pass
 
 # Import Telegram components
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
@@ -633,14 +643,18 @@ class BotResponse:
     def __init__(self, emoji_key=None, header=None):
         """
         Initialize a bot response.
-        
+    
         Args:
             emoji_key (str, optional): Key to lookup in EMOJI dictionary
             header (str, optional): Header text for the message
         """
         self.parts = []
-        # Handle missing EMOJI dictionary
-        emoji_dict = globals().get('EMOJI', {})
+    
+        # Get emoji dict safely
+        emoji_dict = {}
+        if 'EMOJI' in globals():
+            emoji_dict = globals().get('EMOJI', {})
+    
         if emoji_key and emoji_key in emoji_dict:
             self.header = f"{emoji_dict[emoji_key]} {header}" if header else emoji_dict[emoji_key]
         else:
@@ -1624,66 +1638,57 @@ class RetryableOperation:
         self.retry_on = retry_on
         self.use_jitter = jitter
     
-    async def run(self, operation_func, operation_name=None, *args, **kwargs):
-        """
-        Execute an async operation with retry logic.
-        
-        Args:
-            operation_func (callable): Async function to execute
-            operation_name (str, optional): Name of operation for logging
-            *args, **kwargs: Arguments to pass to the operation function
+async def run(self, operation_func, operation_name=None, *args, **kwargs):
+    """
+    Execute an async operation with retry logic.
+    """
+    if not operation_name:
+        operation_name = getattr(operation_func, "__name__", "unknown_operation")
+    
+    retry_count = 0
+    last_exception = None
+    
+    while retry_count <= self.max_retries:
+        try:
+            # Attempt the operation
+            result = await operation_func(*args, **kwargs)
+            return result
             
-        Returns:
-            The result of the operation
+        except self.retry_on as e:
+            # This is a retryable error
+            retry_count += 1
+            last_exception = e
             
-        Raises:
-            Exception: The last exception encountered after all retries
-        """
-        if not operation_name:
-            operation_name = operation_func.__name__
-        
-        retry_count = 0
-        last_exception = None
-        
-        while retry_count <= self.max_retries:
-            try:
-                # Attempt the operation
-                return await operation_func(*args, **kwargs)
-                
-            except self.retry_on as e:
-                # This is a retryable error
-                retry_count += 1
-                last_exception = e
-                
-                if retry_count > self.max_retries:
-                    self.loggers["errors"].error(
-                        f"Operation '{operation_name}' failed after {retry_count} attempts: {e}"
-                    )
-                    break
-                
-                # Calculate delay with exponential backoff
-                delay = self.base_delay * (2 ** (retry_count - 1))
-                
-                # Add jitter if enabled (helps prevent thundering herd problem)
-                if self.use_jitter:
-                    jitter_amount = random.uniform(0, 0.5 * delay)
-                    delay += jitter_amount
-                
-                self.loggers["main"].warning(
-                    f"Operation '{operation_name}' attempt {retry_count}/{self.max_retries} "
-                    f"failed: {e}. Retrying in {delay:.2f} seconds."
-                )
-                await asyncio.sleep(delay)
-                
-            except Exception as e:
-                # Non-retryable error
+            if retry_count > self.max_retries:
                 self.loggers["errors"].error(
-                    f"Non-retryable error in operation '{operation_name}': {type(e).__name__}: {e}"
+                    f"Operation '{operation_name}' failed after {retry_count} attempts: {e}"
                 )
-                raise
-        
-        # If we get here, all retries failed
-        raise last_exception or RuntimeError(f"Operation '{operation_name}' failed for unknown reasons")
+                break
+            
+            # Calculate delay with exponential backoff
+            delay = min(self.base_delay * (2 ** (retry_count - 1)), 60)  # Cap at 60 seconds
+            
+            # Add jitter if enabled (helps prevent thundering herd problem)
+            if self.use_jitter:
+                jitter_amount = random.uniform(0, 0.5 * delay)
+                delay += jitter_amount
+            
+            self.loggers["main"].warning(
+                f"Operation '{operation_name}' attempt {retry_count}/{self.max_retries} "
+                f"failed: {e}. Retrying in {delay:.2f} seconds."
+            )
+            await asyncio.sleep(delay)
+            
+        except Exception as e:
+            # Non-retryable error
+            self.loggers["errors"].error(
+                f"Non-retryable error in operation '{operation_name}': {type(e).__name__}: {e}"
+            )
+            raise
+    
+    # If we get here, all retries failed
+    raise last_exception or RuntimeError(f"Operation '{operation_name}' failed for unknown reasons")
+
 def check_rate_limit(context, user_id, action_type):
     """
     Check if user has exceeded rate limits.
@@ -1971,17 +1976,15 @@ def cleanup_persistence_file(context, loggers):
         new_size = os.path.getsize("bot_persistence_clean") / (1024 * 1024)
         
         # Rename the clean file to replace the original
-        if os.path.exists("bot_persistence_clean"):
-            # On Windows, we need to make sure the target doesn't exist
-            if os.path.exists("bot_persistence"):
-                os.remove("bot_persistence")
-            os.rename("bot_persistence_clean", "bot_persistence")
-        
-        loggers["main"].info(
-            f"Cleaned persistence file. Old size: {current_size:.2f}MB, New size: {new_size:.2f}MB"
-        )
-        
-        return True, current_size, new_size
+        try:
+            if os.path.exists("bot_persistence_clean"):
+                # On Windows, we need to make sure the target doesn't exist
+                if os.path.exists("bot_persistence"):
+                    os.remove("bot_persistence")
+                os.rename("bot_persistence_clean", "bot_persistence")
+        except Exception as e:
+            loggers["errors"].error(f"Error replacing persistence file: {e}")
+            return False, current_size, current_size
         
     except Exception as e:
         loggers["errors"].error(f"Error cleaning up persistence file: {e}")
@@ -6543,10 +6546,32 @@ def memory_usage_report() -> Dict[str, Union[int, float]]:
     """
     Get a report of current memory usage.
     
+    This function reports system resource usage by the bot process.
+    If psutil is not available, returns limited information.
+    
     Returns:
         Dict[str, Union[int, float]]: Memory usage statistics
     """
-    import psutil
+    if not PSUTIL_AVAILABLE:
+        # Return basic information without psutil
+        try:
+            # Try using the resource module as fallback
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return {
+                "memory_usage": usage.ru_maxrss / 1024,  # Convert to MB (system-dependent)
+                "user_cpu_time": usage.ru_utime,
+                "system_cpu_time": usage.ru_stime,
+                "note": "Limited stats (psutil not installed)"
+            }
+        except (ImportError, AttributeError):
+            # If resource module also not available (Windows without psutil)
+            return {
+                "note": "Memory stats unavailable (psutil not installed)",
+                "recommendation": "Install psutil for more detailed system statistics"
+            }
+            
+    # If psutil is available
     import gc
     
     # Force garbage collection
@@ -6570,6 +6595,9 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """
     Admin command to get debugging information.
     
+    This command provides system statistics and bot performance metrics.
+    Only available to the administrator.
+    
     Args:
         update: Telegram update
         context: Conversation context
@@ -6582,25 +6610,47 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
         
     try:
+        # Create base debug report
+        report = BotResponse("debug").add_header("Debug Information", "debug")
+        
         # Get memory usage report
+        mem_usage = memory_usage_report()
+        
+        # Format the report
+        report.add_paragraph("System Status:")
+        
+        # Add memory usage stats if available
+        if "rss" in mem_usage:
+            report.add_bullet_list([
+                f"Memory usage: {mem_usage['rss']:.2f} MB RSS",
+                f"Memory percent: {mem_usage['percent']:.1f}%",
+                f"Threads: {mem_usage['num_threads']}",
+                f"Open files: {mem_usage['open_files']}",
+            ])
+        elif "memory_usage" in mem_usage:
+            report.add_bullet_list([
+                f"Memory usage: {mem_usage['memory_usage']:.2f} MB",
+                f"User CPU time: {mem_usage['user_cpu_time']:.2f}s",
+                f"System CPU time: {mem_usage['system_cpu_time']:.2f}s",
+            ])
+        else:
+            report.add_paragraph(mem_usage.get("note", "No memory statistics available"))
+            if "recommendation" in mem_usage:
+                report.add_paragraph(f"💡 {mem_usage['recommendation']}")
+        
+        # Add persistence file info
         try:
-            mem_usage = memory_usage_report()
-            
-            # Format the report
-            report = BotResponse("debug") \
-                .add_header("Debug Information", "debug") \
-                .add_paragraph("System Status:") \
-                .add_bullet_list([
-                    f"Memory usage: {mem_usage['rss']:.2f} MB RSS",
-                    f"Memory percent: {mem_usage['percent']:.1f}%",
-                    f"Threads: {mem_usage['num_threads']}",
-                    f"Open files: {mem_usage['open_files']}",
-                    f"Persistence file: {get_persistence_file_size():.2f} MB",
-                    f"Uptime: {time.time() - context.bot_data.get('start_time', time.time()):.1f} seconds",
-                ])
-                
-            # Add cache stats if available
-            try:
+            persistence_size = get_persistence_file_size()
+            report.add_bullet_list([
+                f"Persistence file: {persistence_size:.2f} MB",
+                f"Uptime: {time.time() - context.bot_data.get('start_time', time.time()):.1f} seconds",
+            ])
+        except Exception as e:
+            report.add_paragraph(f"Could not get persistence file info: {str(e)}")
+        
+        # Add cache stats if available
+        try:
+            if 'google_apis' in globals():
                 cache_stats = google_apis.get_cache_stats()
                 report.add_paragraph("Cache Statistics:") \
                     .add_bullet_list([
@@ -6609,26 +6659,22 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         f"Cache misses: {cache_stats['cache_misses']}",
                         f"Total requests: {cache_stats['total_requests']}",
                     ])
-            except Exception:
-                pass
-                
-            # Add active user count
-            active_users = 0
-            if "sessions" in context.bot_data:
-                active_users = len(context.bot_data["sessions"])
-                
-            report.add_paragraph("User Statistics:") \
-                .add_bullet_list([
-                    f"Active users: {active_users}",
-                ])
-                
-            # Send the report
-            await update.message.reply_text(report.get_message())
-                
-        except ImportError:
-            await update.message.reply_text(
-                f"{EMOJI['error']} Debug module not available. Please install psutil."
-            )
+        except Exception:
+            pass
+            
+        # Add active user count
+        active_users = 0
+        if "sessions" in context.bot_data:
+            active_users = len(context.bot_data["sessions"])
+            
+        report.add_paragraph("User Statistics:") \
+            .add_bullet_list([
+                f"Active users: {active_users}",
+            ])
+            
+        # Send the report
+        await update.message.reply_text(report.get_message())
+            
     except Exception as e:
         await update.message.reply_text(
             f"{EMOJI['error']} Error generating debug report: {str(e)}"
@@ -6776,32 +6822,40 @@ def main():
             conversation_timeout=300  # 5 minutes timeout
         )
         
-        # Add scheduled cleanup jobs
         async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
             """Periodic job to clean up resources and prevent memory leaks"""
             try:
                 # Clean up old sessions
-                session_cleanup_count = cleanup_old_sessions(context)
-                if session_cleanup_count > 0:
-                    loggers["main"].info(f"Cleaned up {session_cleanup_count} old sessions")
-                
+                try:
+                    session_cleanup_count = cleanup_old_sessions(context)
+                    if session_cleanup_count > 0:
+                        loggers["main"].info(f"Cleaned up {session_cleanup_count} old sessions")
+                except Exception as e:
+                    loggers["errors"].error(f"Error cleaning up sessions: {e}")
+        
                 # Clean up abandoned carts
-                cart_cleanup_count = await cleanup_abandoned_carts(context, order_manager, loggers)
-                if cart_cleanup_count > 0:
-                    loggers["main"].info(f"Cleaned up {cart_cleanup_count} abandoned carts")
-                
-                # Check persistence file size and clean up if needed
-                persistence_size = get_persistence_file_size()
-                if persistence_size > 10:  # If larger than 10MB
-                    loggers["main"].info(f"Persistence file size: {persistence_size:.2f}MB, attempting cleanup")
-                    success, old_size, new_size = cleanup_persistence_file(context, loggers)
-                    if success:
-                        reduction = old_size - new_size
-                        reduction_pct = (reduction / old_size) * 100 if old_size > 0 else 0
-                        loggers["main"].info(
-                            f"Persistence cleanup successful. Reduced by {reduction:.2f}MB ({reduction_pct:.1f}%)"
-                        )
-                
+                try:
+                    cart_cleanup_count = await cleanup_abandoned_carts(context, order_manager, loggers)
+                    if cart_cleanup_count > 0:
+                        loggers["main"].info(f"Cleaned up {cart_cleanup_count} abandoned carts")
+                except Exception as e:
+                    loggers["errors"].error(f"Error cleaning up carts: {e}")
+        
+                # Check persistence file size
+                try:
+                    persistence_size = get_persistence_file_size()
+                    if persistence_size > 10:  # If larger than 10MB
+                        loggers["main"].info(f"Persistence file size: {persistence_size:.2f}MB, attempting cleanup")
+                        success, old_size, new_size = cleanup_persistence_file(context, loggers)
+                        if success:
+                            reduction = old_size - new_size
+                            reduction_pct = (reduction / old_size) * 100 if old_size > 0 else 0
+                            loggers["main"].info(
+                                f"Persistence cleanup successful. Reduced by {reduction:.2f}MB ({reduction_pct:.1f}%)"
+                            )
+                except Exception as e:
+                    loggers["errors"].error(f"Error in persistence cleanup: {e}")
+            
             except Exception as e:
                 loggers["errors"].error(f"Error in cleanup job: {e}")
 
