@@ -17,7 +17,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable, cast
 
 # Import Telegram components
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
@@ -28,6 +28,19 @@ from telegram.ext import (
     filters, Application, PicklePersistence, TypeHandler
 )
 from telegram.error import NetworkError, TelegramError, TimedOut
+
+# Import specific errors or define fallbacks
+try:
+    from telegram.error import NetworkError, TelegramError
+except ImportError:
+    # Define fallback error classes if telegram errors not available
+    class NetworkError(Exception):
+        """Fallback for telegram.error.NetworkError"""
+        pass
+    
+    class TelegramError(Exception):
+        """Fallback for telegram.error.TelegramError"""
+        pass
 
 # Import Google API components
 import gspread
@@ -43,6 +56,22 @@ load_dotenv()
 
 # Add after load_dotenv()
 print(f"Debug - TOKEN env var exists: {'Yes' if os.getenv('TELEGRAM_BOT_TOKEN') else 'No'}")
+
+# Check for required dependencies
+required_packages = ['python-telegram-bot', 'google-api-python-client', 'google-auth-httplib2', 'google-auth-oauthlib']
+missing_packages = []
+
+for package in required_packages:
+    try:
+        __import__(package.replace('-', '_'))
+    except ImportError:
+        missing_packages.append(package)
+
+if missing_packages:
+    print("ERROR: Missing required dependencies. Please install:")
+    for package in missing_packages:
+        print(f"  pip install {package}")
+    sys.exit(1)
 
 # ---------------------------- Constants & Configuration ----------------------------
 # States for the ConversationHandler
@@ -360,7 +389,7 @@ RATE_LIMITS = {
 # ---------------------------- Cache Configuration ----------------------------
 CACHE_EXPIRY = {
     "inventory": 300,     # 5 minutes
-    "order_status": 60,   # 1 minute
+    "orders": 60,   # 1 minute
     "customer_info": 600,  # 10 minutes
     "sheets": 120,     # 2 minutes
     "drive": 600,      # 10 minutes
@@ -499,16 +528,19 @@ def mask_sensitive_data(data, mask_type='default'):
         return data
         
     elif mask_type == 'name':
-        # Show first letter of each name part
+        # Show first letter of each name part (with Unicode support)
+        import unicodedata
         name_parts = data.split()
         masked_parts = []
-        
+    
         for part in name_parts:
             if len(part) > 1:
-                masked_parts.append(f"{part[0]}{'*' * (len(part) - 1)}")
+                # Get first character correctly even with multi-byte chars
+                first_char = part[0]
+                masked_parts.append(f"{first_char}{'*' * (len(part) - 1)}")
             else:
                 masked_parts.append(part)
-                
+            
         return ' '.join(masked_parts)
         
     else:
@@ -561,8 +593,8 @@ def log_security_event(logger, event_type, user_id=None, ip=None, details=None):
         ip (str, optional): IP address if available
         details (str, optional): Additional event details
     """
-    # Create a secure log with consistent format
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Create a secure log with consistent format and UTC time
+    timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     user_info = f"User: {user_id}" if user_id else "No user"
     ip_info = f"IP: {ip}" if ip else "No IP"
     details_info = f"Details: {details}" if details else ""
@@ -607,8 +639,10 @@ class BotResponse:
             header (str, optional): Header text for the message
         """
         self.parts = []
-        if emoji_key and emoji_key in EMOJI:
-            self.header = f"{EMOJI[emoji_key]} {header}" if header else EMOJI[emoji_key]
+        # Handle missing EMOJI dictionary
+        emoji_dict = globals().get('EMOJI', {})
+        if emoji_key and emoji_key in emoji_dict:
+            self.header = f"{emoji_dict[emoji_key]} {header}" if header else emoji_dict[emoji_key]
         else:
             self.header = header
     
@@ -868,38 +902,39 @@ class GoogleAPIsManager:
     def _check_cache(self, cache_key, max_age=None):
         """
         Check if cached data exists and is still valid.
-        
+    
         Args:
             cache_key (str): The key for the cached data
             max_age (int, optional): Maximum age of cache in seconds
-                                     If None, uses CACHE_EXPIRY values
-                                     
+                                 If None, uses CACHE_EXPIRY values
+                                 
         Returns:
             tuple: (is_valid, cached_data)
         """
         if not max_age:
             # Use default cache expiry time based on the key
-            for k, v in CACHE_EXPIRY.items():
-                if k in cache_key:
-                    max_age = v
-                    break
-            # Default to 60 seconds if no match
+            if 'CACHE_EXPIRY' in globals():
+                for k, v in CACHE_EXPIRY.items():
+                    if k in cache_key:
+                        max_age = v
+                        break
+            # Default to 60 seconds if no match or no CACHE_EXPIRY
             if not max_age:
                 max_age = 60
                 
-        cache_entry = self.cache.get(cache_key)
-        if not cache_entry or not cache_entry.get("data"):
-            self.cache_misses += 1
-            return False, None
+            cache_entry = self.cache.get(cache_key)
+            if not cache_entry or not cache_entry.get("data"):
+                self.cache_misses += 1
+                return False, None
             
-        # Check if cache is still fresh
-        if time.time() - cache_entry.get("timestamp", 0) > max_age:
-            self.cache_misses += 1
-            return False, None
+            # Check if cache is still fresh
+            if time.time() - cache_entry.get("timestamp", 0) > max_age:
+                self.cache_misses += 1
+                return False, None
             
-        # Cache hit
-        self.cache_hits += 1
-        return True, cache_entry.get("data")
+            # Cache hit
+            self.cache_hits += 1
+            return True, cache_entry.get("data")
         
     def _update_cache(self, cache_key, data):
         """
@@ -1186,8 +1221,8 @@ class GoogleAPIsManager:
             dict: Order details or None if not found
         """
         # For active orders, use a shorter cache expiry to get updates
-        # Check if we have this order already cached
-        cache_key = f"order_{order_id}"
+        # Create a more specific cache key to avoid collisions
+        cache_key = f"order_details_{order_id}"
         is_valid, cached_data = self._check_cache(cache_key, max_age=30)  # Short cache time for orders
         if is_valid:
             return cached_data
@@ -1750,16 +1785,8 @@ def cleanup_old_sessions(context):
 async def cleanup_abandoned_carts(context, order_manager, loggers):
     """
     Find and clean up abandoned carts (incomplete orders).
-    
-    Args:
-        context: The conversation context
-        order_manager: OrderManager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        int: Number of carts cleaned up
     """
-    if not hasattr(context, "user_data"):
+    if not hasattr(context, "user_data") or not context.user_data:
         return 0
     
     now = time.time()
@@ -1767,7 +1794,8 @@ async def cleanup_abandoned_carts(context, order_manager, loggers):
     user_ids_with_abandoned_carts = []
     
     # Find users with abandoned carts (active over 3 hours)
-    for user_id, user_data in context.user_data.items():
+    for user_id in context.user_data:
+        user_data = context.user_data[user_id]
         # Skip users that don't have cart data
         if "cart" not in user_data:
             continue
@@ -1944,7 +1972,10 @@ def cleanup_persistence_file(context, loggers):
         
         # Rename the clean file to replace the original
         if os.path.exists("bot_persistence_clean"):
-            os.replace("bot_persistence_clean", "bot_persistence")
+            # On Windows, we need to make sure the target doesn't exist
+            if os.path.exists("bot_persistence"):
+                os.remove("bot_persistence")
+            os.rename("bot_persistence_clean", "bot_persistence")
         
         loggers["main"].info(
             f"Cleaned persistence file. Old size: {current_size:.2f}MB, New size: {new_size:.2f}MB"
@@ -2074,7 +2105,7 @@ class InventoryManager:
     Manage product inventory with caching and efficient access patterns.
     """
     
-    def __init__(self, google_apis, loggers: Dict[str, logging.Logger]) -> None:
+    def __init__(self, google_apis: Any, loggers: Dict[str, logging.Logger]) -> None:
         """
         Initialize the inventory manager.
         
@@ -2123,34 +2154,31 @@ class InventoryManager:
     async def get_inventory_safe(self, force_refresh=False):
         """
         Get inventory data with graceful degradation if API fails.
-        
-        This method tries multiple approaches to get inventory data, falling back
-        to successively simpler methods as needed to ensure the bot remains functional
-        even when facing API issues.
-        
+    
         Args:
             force_refresh (bool): Force refresh the cache regardless of age
-            
+        
         Returns:
             tuple: (products_by_tag, products_by_strain, all_products)
         """
         try:
             # First attempt - normal get_inventory with caching
             return await self.get_inventory(force_refresh)
-            
+        
         except Exception as primary_error:
             # Log the primary error
             self.loggers["errors"].error(f"Primary inventory fetch failed: {primary_error}")
-            
+        
             try:
                 # Second attempt - try with default settings and no force refresh
                 if force_refresh:
                     self.loggers["main"].warning("Retrying inventory fetch without force refresh")
+                    # Call get_inventory directly, not get_inventory_safe to avoid recursion
                     return await self.get_inventory(False)
-                
+            
                 # If we're already using cached data or defaults, raise the original error
                 raise primary_error
-                
+            
             except Exception as secondary_error:
                 # Log the secondary error
                 self.loggers["errors"].error(f"Secondary inventory fetch failed: {secondary_error}")
@@ -6919,5 +6947,5 @@ def main():
         print(f"Critical error: {e}")
         sys.exit(1)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
