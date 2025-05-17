@@ -427,6 +427,7 @@ def setup_logging():
 def log_order(logger, order_data, action="created"):
     """
     Log order information with consistent formatting.
+    Sensitive data is masked for security.
     
     Args:
         logger: The logger instance to use
@@ -434,13 +435,80 @@ def log_order(logger, order_data, action="created"):
         action (str): Action being performed on the order
     """
     order_id = order_data.get("order_id", "Unknown")
-    customer = order_data.get("name", "Unknown")
+    customer = mask_sensitive_data(order_data.get("name", "Unknown"), 'name')
     total = order_data.get("total", 0)
     
     logger.info(
         f"Order {order_id} {action} | Customer: {customer} | "
         f"Total: ₱{total:,.2f} | Items: {order_data.get('items_count', 0)}"
     )
+
+def mask_sensitive_data(data, mask_type='default'):
+    """
+    Mask sensitive data for logging purposes.
+    
+    Args:
+        data (str): Data to mask
+        mask_type (str): Type of data being masked ('phone', 'address', 'name', etc.)
+        
+    Returns:
+        str: Masked data
+    """
+    if not data:
+        return ''
+    
+    data = str(data)
+    
+    if mask_type == 'phone':
+        # Mask phone number - keep first 3 and last 2 digits
+        if len(data) > 5:
+            visible_part = data[:3] + '*' * (len(data) - 5) + data[-2:]
+            return visible_part
+        return '*' * len(data)
+    
+    elif mask_type == 'address':
+        # For address, show only the first part and city
+        parts = data.split(',')
+        if len(parts) > 1:
+            # Take first part of street address
+            street = parts[0].strip()
+            city_part = parts[-1].strip()
+            
+            # Get house/building number if available
+            address_parts = street.split(' ', 1)
+            
+            if len(address_parts) > 1 and address_parts[0].isdigit():
+                # Show house number and first letter of street name
+                masked_street = address_parts[0] + ' ' + address_parts[1][0] + '*' * (len(address_parts[1]) - 1)
+            else:
+                # Just show first 3 chars of address
+                masked_street = street[:3] + '*' * (len(street) - 3) if len(street) > 3 else street
+                
+            return f"{masked_street}, {city_part}"
+        
+        # If simple address, show first 4 chars
+        if len(data) > 4:
+            return data[:4] + '*' * (len(data) - 4)
+        return data
+        
+    elif mask_type == 'name':
+        # Show first letter of each name part
+        name_parts = data.split()
+        masked_parts = []
+        
+        for part in name_parts:
+            if len(part) > 1:
+                masked_parts.append(f"{part[0]}{'*' * (len(part) - 1)}")
+            else:
+                masked_parts.append(part)
+                
+        return ' '.join(masked_parts)
+        
+    else:
+        # Default masking - show first 3 chars and last char
+        if len(data) > 4:
+            return data[:3] + '*' * (len(data) - 4) + data[-1]
+        return '*' * len(data)
 
 def log_payment(logger, order_id, status, amount=None):
     """
@@ -473,6 +541,27 @@ def log_error(logger, function_name, error, user_id=None):
     
     logger.error(
         f"Error in {function_name}{user_info} | {type(error).__name__}: {str(error)}"
+    )
+
+def log_security_event(logger, event_type, user_id=None, ip=None, details=None):
+    """
+    Log security-related events for monitoring and auditing.
+    
+    Args:
+        logger: The logger instance to use
+        event_type (str): Type of security event
+        user_id (int, optional): Telegram user ID if applicable
+        ip (str, optional): IP address if available
+        details (str, optional): Additional event details
+    """
+    # Create a secure log with consistent format
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    user_info = f"User: {user_id}" if user_id else "No user"
+    ip_info = f"IP: {ip}" if ip else "No IP"
+    details_info = f"Details: {details}" if details else ""
+    
+    logger["security"].warning(
+        f"SECURITY EVENT [{event_type}] | {timestamp} | {user_info} | {ip_info} | {details_info}"
     )
 
 def log_admin_action(logger, admin_id, action, order_id=None):
@@ -1673,7 +1762,9 @@ def cleanup_persistence_file(context, loggers):
             
             # If active in the last 30 days, keep their data
             if now - last_activity < 2592000:  # 30 days in seconds
-                essential_data["user_data"][user_id] = user_data
+                # Scrub sensitive data before persistence
+                scrubbed_data = scrub_sensitive_data(user_data)
+                essential_data["user_data"][user_id] = scrubbed_data
         
         # Use pickle to save the essential data
         with open("bot_persistence_clean", "wb") as f:
@@ -1695,6 +1786,44 @@ def cleanup_persistence_file(context, loggers):
     except Exception as e:
         loggers["errors"].error(f"Error cleaning up persistence file: {e}")
         return False, current_size, current_size
+    
+def scrub_sensitive_data(data_dict):
+    """
+    Recursively remove sensitive data from dictionaries before persistence.
+    
+    Args:
+        data_dict (dict): Dictionary to scrub
+        
+    Returns:
+        dict: Scrubbed dictionary
+    """
+    if not isinstance(data_dict, dict):
+        return data_dict
+    
+    scrubbed_dict = {}
+    
+    for key, value in data_dict.items():
+        # Skip sensitive keys entirely
+        if key in ['password', 'credit_card', 'token', 'secret']:
+            continue
+        
+        # Recursively scrub nested dictionaries
+        if isinstance(value, dict):
+            scrubbed_dict[key] = scrub_sensitive_data(value)
+        # Scrub sensitive data in lists
+        elif isinstance(value, list):
+            scrubbed_dict[key] = [
+                scrub_sensitive_data(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        # Special handling for potentially sensitive fields
+        elif isinstance(value, str) and key in ['address', 'contact', 'phone', 'email']:
+            # Don't actually store the sensitive data in persistence
+            scrubbed_dict[key] = f"{value[:3]}***(masked for security)"
+        else:
+            scrubbed_dict[key] = value
+    
+    return scrubbed_dict
 
 def generate_order_id():
     """
@@ -3640,6 +3769,15 @@ async def handle_payment_screenshot(
             file = await photo.get_file()
             file_bytes = await file.download_as_bytearray()
             
+            # Validate the image
+            is_valid, message = validate_image(file_bytes)
+            if not is_valid:
+                await update.message.reply_text(
+                    f"{EMOJI['error']} {message}\n\n"
+                    "Please send a valid image file for your payment screenshot."
+                )
+                return PAYMENT
+            
             # Generate filename
             current_date = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
             user_name = context.user_data.get("name", "Unknown")
@@ -3685,6 +3823,41 @@ async def handle_payment_screenshot(
     else:
         await update.message.reply_text(MESSAGES["invalid_payment"])
         return PAYMENT
+
+def validate_image(file_bytes, max_size_mb=5):
+    """
+    Validate an uploaded image for security.
+    
+    Args:
+        file_bytes (ByteArray): Raw image data
+        max_size_mb (int): Maximum allowed size in MB
+        
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    # Check file size
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if size_mb > max_size_mb:
+        return False, f"File too large: {size_mb:.1f}MB (max {max_size_mb}MB)"
+    
+    # Check file signature (magic numbers)
+    # JPEG signature
+    if file_bytes[:3] == b'\xFF\xD8\xFF':
+        return True, "JPEG image"
+    
+    # PNG signature
+    if file_bytes[:8] == b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A':
+        return True, "PNG image"
+    
+    # GIF signature
+    if file_bytes[:6] in (b'GIF87a', b'GIF89a'):
+        return True, "GIF image"
+    
+    # WebP signature
+    if file_bytes[:4] == b'RIFF' and file_bytes[8:12] == b'WEBP':
+        return True, "WebP image"
+    
+    return False, "Invalid file format (only JPEG, PNG, GIF, and WebP images are allowed)"
 
 async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -5189,6 +5362,16 @@ async def enhanced_error_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Log the error details
     error_text = f"User: {user_id} | Chat: {chat_id} | Error: {type(error).__name__}: {error}"
     loggers["errors"].error(f"Error in enhanced_error_handler | {error_text}")
+    
+    # Log as security event if it might be security-related
+    if (isinstance(error, ValueError) and "Invalid" in str(error)) or \
+       any(term in str(error).lower() for term in ["injection", "script", "attack", "overflow", "invalid token"]):
+        log_security_event(
+            loggers, 
+            "POTENTIAL_SECURITY_ISSUE",
+            user_id=user_id,
+            details=f"Possible security issue: {type(error).__name__}: {str(error)}"
+        )
     
     # Skip known command errors - these will be handled by command_not_found
     if isinstance(error, TelegramError) and "Command not found" in str(error):
