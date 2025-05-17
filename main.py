@@ -1614,7 +1614,7 @@ def build_category_buttons(available_categories):
     Returns:
         InlineKeyboardMarkup: Keyboard with product category buttons
     """
-    keyboard = []
+    buttons = []
     
     # Debug print to verify available categories
     print(f"DEBUG: Building category buttons for: {available_categories}")
@@ -1624,21 +1624,12 @@ def build_category_buttons(available_categories):
             product = PRODUCTS[product_id]
             button_text = f"{product['emoji']} {product['name']}"
             
-            # Debug print for button creation
-            print(f"DEBUG: Creating button with text: '{button_text}', callback_data: '{product_id}'")
-            
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=product_id)])
+            buttons.append([InlineKeyboardButton(button_text, callback_data=product_id)])
     
     # Add cancel button
-    keyboard.append([InlineKeyboardButton(f"{EMOJI['error']} Cancel", callback_data="cancel")])
+    buttons.append([create_button("cancel", "cancel", "Cancel")])
     
-    # Return the markup
-    markup = InlineKeyboardMarkup(keyboard)
-    
-    # Debug print to verify markup structure
-    print(f"DEBUG: Created keyboard with {len(keyboard)} buttons")
-    
-    return markup
+    return InlineKeyboardMarkup(buttons)
 
 def build_admin_buttons():
     """
@@ -1647,14 +1638,14 @@ def build_admin_buttons():
     Returns:
         InlineKeyboardMarkup: Keyboard with admin options
     """
-    keyboard = [
-        [InlineKeyboardButton(f"{EMOJI['list']} View All Orders", callback_data='view_orders')],
-        [InlineKeyboardButton(f"{EMOJI['search']} Search Order by ID", callback_data='search_order')],
-        [InlineKeyboardButton(f"{EMOJI['inventory']} Manage Inventory", callback_data='manage_inventory')],
-        [InlineKeyboardButton(f"{EMOJI['review']} Review Payments", callback_data='approve_payments')]
+    buttons = [
+        [create_button("action", "view_orders", f"{EMOJI['list']} View All Orders")],
+        [create_button("action", "search_order", f"{EMOJI['search']} Search Order by ID")],
+        [create_button("action", "manage_inventory", f"{EMOJI['inventory']} Manage Inventory")],
+        [create_button("action", "approve_payments", f"{EMOJI['review']} Review Payments")]
     ]
     
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(buttons)
 
 def build_cart_summary(cart):
     """
@@ -1796,6 +1787,152 @@ def validate_sensitive_data(data_type, value):
     
     # Default case
     return True, value
+
+def create_button(button_type, callback_data=None, custom_text=None, url=None):
+    """
+    Factory function to create common button types with consistent styling.
+    
+    Args:
+        button_type (str): Type of button ('back', 'action', 'status', etc.)
+        callback_data (str, optional): Callback data for the button
+        custom_text (str, optional): Custom button text
+        url (str, optional): URL for link buttons
+    
+    Returns:
+        InlineKeyboardButton: Configured button with appropriate text and callback
+    """
+    if button_type == "back":
+        destination = callback_data.replace("back_to_", "") if callback_data else "previous"
+        destination_text = destination.replace("_", " ").title()
+        text = f"{EMOJI['back']} Back to {destination_text}" if not custom_text else f"{EMOJI['back']} {custom_text}"
+        return InlineKeyboardButton(text, callback_data=callback_data or "back")
+        
+    elif button_type == "action":
+        # Extract emoji key from callback data if possible
+        emoji_key = callback_data.split("_")[0] if callback_data and "_" in callback_data else callback_data
+        emoji = EMOJI.get(emoji_key, EMOJI.get("info", "ℹ️"))
+        text = f"{emoji} {custom_text}" if custom_text else f"{emoji} {callback_data.replace('_', ' ').title()}"
+        return InlineKeyboardButton(text, callback_data=callback_data)
+        
+    elif button_type == "link":
+        if not url:
+            raise ValueError("URL is required for link buttons")
+        emoji = EMOJI.get("link", "🔗")
+        text = f"{emoji} {custom_text}" if custom_text else f"{emoji} Link"
+        return InlineKeyboardButton(text, url=url)
+        
+    elif button_type == "cancel":
+        text = f"{EMOJI['error']} {custom_text}" if custom_text else f"{EMOJI['error']} Cancel"
+        return InlineKeyboardButton(text, callback_data=callback_data or "cancel")
+    
+    # Default case - generic button
+    return InlineKeyboardButton(custom_text or "Button", callback_data=callback_data or "generic")
+
+def create_button_layout(buttons, columns=1):
+    """
+    Create a standardized button layout with specified number of columns.
+    
+    Args:
+        buttons (list): List of InlineKeyboardButton objects or lists of buttons
+        columns (int): Number of buttons per row
+    
+    Returns:
+        InlineKeyboardMarkup: Formatted keyboard markup
+    """
+    keyboard = []
+    
+    # If buttons already contains rows (nested lists), use them directly
+    if buttons and isinstance(buttons[0], list):
+        keyboard = buttons
+    else:
+        # Create rows based on columns specification
+        row = []
+        for idx, button in enumerate(buttons):
+            row.append(button)
+            if (idx + 1) % columns == 0:
+                keyboard.append(row)
+                row = []
+        
+        # Add any remaining buttons
+        if row:
+            keyboard.append(row)
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_navigation_buttons(current_location=None, include_home=True, include_help=True, custom_back=None):
+    """
+    Get appropriate navigation buttons based on current location.
+    
+    Args:
+        current_location (str, optional): Current conversation location
+        include_home (bool): Whether to include main menu button
+        include_help (bool): Whether to include help button
+        custom_back (tuple, optional): Custom back button (text, callback_data)
+    
+    Returns:
+        list: List of InlineKeyboardButton objects
+    """
+    buttons = []
+    
+    # Add context-specific back button
+    if custom_back:
+        buttons.append(InlineKeyboardButton(
+            f"{EMOJI['back']} {custom_back[0]}", 
+            callback_data=custom_back[1]
+        ))
+    elif current_location:
+        # Standard back buttons based on location
+        if "product_" in current_location:
+            buttons.append(create_button("back", "back_to_browse", "Back to Browse"))
+        elif current_location == "strain_selection":
+            buttons.append(create_button("back", "back_to_categories", "Back to Categories"))
+        elif current_location == "browse_carts_by":
+            buttons.append(create_button("back", "back_to_categories", "Back to Categories"))
+        elif current_location == "admin_orders":
+            buttons.append(create_button("back", "back_to_admin", "Back to Admin Panel"))
+    
+    # Add home button if requested
+    if include_home:
+        buttons.append(InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start"))
+    
+    # Add help button if requested
+    if include_help:
+        buttons.append(InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help"))
+    
+    return buttons
+
+def get_common_buttons(button_type, context_data=None):
+    """
+    Get common button groups used throughout the application.
+    
+    Args:
+        button_type (str): Type of button group ('order_actions', 'confirm_cancel', etc.)
+        context_data (dict, optional): Additional context data for customizing buttons
+    
+    Returns:
+        list: List of InlineKeyboardButton objects or rows
+    """
+    if button_type == "confirm_cancel":
+        return [
+            [create_button("action", "confirm", "Confirm")],
+            [create_button("cancel", "cancel", "Cancel")]
+        ]
+    
+    elif button_type == "order_actions":
+        return [
+            [create_button("action", "add_more", "Add More", f"{EMOJI['cart']} Add More")],
+            [create_button("action", "proceed", "Proceed to Checkout", f"{EMOJI['shipping']} Proceed to Checkout")],
+            [create_button("cancel", "cancel", "Cancel Order")]
+        ]
+    
+    elif button_type == "restart_home":
+        return [
+            [create_button("action", "restart_conversation", "Reset Session", f"{EMOJI['restart']} Reset Session")],
+            [create_button("action", "start", "Main Menu", f"{EMOJI['home']} Main Menu")]
+        ]
+    
+    # Default empty button list
+    return []
 
 def validate_quantity(text, category=None):
     """
@@ -3221,33 +3358,24 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
             # For Carts, choose browsing option first
             print(f"DEBUG: Selected carts category, showing browse options")
             browse_options = product.get("browse_options", [])
-            keyboard = []
-            
+            buttons = []
+                        
             for option in browse_options:
                 option_text = f"Browse by {option.capitalize()}"
-                keyboard.append([InlineKeyboardButton(option_text, callback_data=option)])
+                buttons.append([InlineKeyboardButton(option_text, callback_data=option)])
                 
             # Add back button
-            keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")])
-            
-            await query.edit_message_text(
-                f"{product['emoji']} How would you like to browse {product['name']}?",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return BROWSE_BY
-        
+            buttons.append([create_button("back", "back_to_categories", "Back")])
+                        
+            keyboard = buttons
+
         elif product.get("requires_strain_selection", False):
             # For products requiring strain selection (buds, edibles)
             print(f"DEBUG: Selected {category} category, requires strain selection")
             
             # Define the keyboard clearly
-            keyboard = [
-                [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
-                [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
-                [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
-            ]
-            
+            keyboard = get_common_buttons("strain_buttons")
+
             # Debug keyboard structure
             print(f"DEBUG: Creating strain keyboard with {len(keyboard)} buttons")
             for row in keyboard:
@@ -3336,7 +3464,7 @@ async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_T
                 keyboard = [
                     [InlineKeyboardButton("Browse by Brand", callback_data="brand")],
                     [InlineKeyboardButton("Browse by Weight", callback_data="weight")],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                    [create_button("back", "back_to_categories", "Back to Categories")]
                 ]
                 
                 await query.edit_message_text(
@@ -3349,12 +3477,7 @@ async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_T
                 # Return to strain type selection for buds
                 context.user_data["current_location"] = "strain_selection"
                 
-                keyboard = [
-                    [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
-                    [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
-                    [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-                ]
+                keyboard = get_common_buttons("strain_buttons")
                 
                 await query.edit_message_text(
                     f"{EMOJI['buds']} Select Strain Type:",
@@ -3380,7 +3503,7 @@ async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_T
                 [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
                 [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
                 [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                [create_button("back", "back_to_categories", "Back to Categories")]
             ]
             
             await query.edit_message_text(
@@ -3594,7 +3717,7 @@ async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
         keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
     
     # Add back button
-    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_strain")])
+    keyboard.append([create_button("back", "back_to_strain", "Back")])
     
     # Create message based on category
     if category == "edibles":
@@ -3773,7 +3896,7 @@ async def show_local_products(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("50 grams - ₱5,000", callback_data="qty_50")],
         [InlineKeyboardButton("100 grams - ₱8,000 (Save ₱2,000!)", callback_data="qty_100")],
         [InlineKeyboardButton("300 grams - ₱24,000 (Save ₱6,000 + Free Shipping!)", callback_data="qty_300")],
-        [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
+        [create_button("back", "back_to_categories", "Back")]
     ]
     
     # Display local products with quantity options
@@ -4130,10 +4253,7 @@ async def input_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
         )
     
     # Create confirmation buttons
-    keyboard = [
-        [InlineKeyboardButton(f"{EMOJI['success']} Confirm Selection", callback_data="confirm")],
-        [InlineKeyboardButton(f"{EMOJI['error']} Cancel", callback_data="cancel")],
-    ]
+    keyboard = get_common_buttons("confirm_cancel")
     
     # Log the selection
     loggers["main"].info(
@@ -4200,11 +4320,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE, logg
         
         await query.edit_message_text(
             MESSAGES["order_added"],
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['cart']} Add More", callback_data="add_more")],
-                [InlineKeyboardButton(f"{EMOJI['shipping']} Proceed to Checkout", callback_data="proceed")],
-                [InlineKeyboardButton(f"{EMOJI['error']} Cancel Order", callback_data="cancel")]
-            ]),
+            reply_markup=create_button_layout(get_common_buttons("order_actions")),
         )
         return CONFIRM
     
@@ -4937,11 +5053,7 @@ async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         # Create the keyboard buttons
-        keyboard = [
-            [InlineKeyboardButton("🔄 Refresh Status", callback_data=f"refresh_tracking_{order_id}")],
-            [InlineKeyboardButton(f"{EMOJI['support']} Need Help?", callback_data="contact_support")],
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Main Menu", callback_data="start")]
-        ]
+        keyboard = get_common_buttons("tracking_options", order_id)
         
         # Use a try-except block for sending the message to handle potential errors
         try:
@@ -5251,7 +5363,7 @@ class AdminPanel:
             # Create filter buttons
             filter_buttons = self._build_filter_buttons(status_filter)
             keyboard = filter_buttons + [
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]
+                [create_button("back", "back_to_admin", "Back to Admin Panel")]
             ]
             
             await query.edit_message_text(
@@ -5308,7 +5420,7 @@ class AdminPanel:
             order_buttons + 
             nav_buttons + 
             filter_buttons + 
-            [[InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data='back_to_admin')]]
+            [[create_button("back", "back_to_admin", "Back to Admin Panel")]]
         )
         
         self.loggers["admin"].info(f"Admin viewed orders with filter: {status_filter}")
@@ -5387,8 +5499,8 @@ class AdminPanel:
         if not order_details:
             # Prepare error message
             error_message = MESSAGES["order_not_found"].format(order_id)
-            back_button = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+            back_button = create_button_layout([
+                [create_button("back", "view_orders", "Back to Orders")]
             ])
             
             # Send or edit the message based on update type
@@ -5427,13 +5539,13 @@ class AdminPanel:
         
         # Create management buttons
         keyboard = [
-            [InlineKeyboardButton(f"{EMOJI['update']} Update Status", callback_data=f'update_status_{order_id}')],
-            [InlineKeyboardButton(f"{EMOJI['link']} Add/Update Tracking", callback_data=f'add_tracking_{order_id}')],
-            [InlineKeyboardButton(f"{EMOJI['screenshot']} View Payment Screenshot", callback_data=f'view_payment_{order_id}')]
+            [create_button("action", f'update_status_{order_id}', f"{EMOJI['update']} Update Status")],
+            [create_button("action", f'add_tracking_{order_id}', f"{EMOJI['link']} Add/Update Tracking")],
+            [create_button("action", f'view_payment_{order_id}', f"{EMOJI['screenshot']} View Payment Screenshot")]
         ]
-        
+
         # Add back button
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')])
+        keyboard.append([create_button("back", "view_orders", "Back to Orders")])
         
         self.loggers["admin"].info(f"Admin viewing order details for {order_id}")
         
@@ -5473,8 +5585,8 @@ class AdminPanel:
         if not order_details:
             await query.edit_message_text(
                 MESSAGES["order_not_found"].format(order_id),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                reply_markup=create_button_layout([
+                    [create_button("back", "view_orders", "Back to Orders")]
                 ])
             )
             return
@@ -5485,8 +5597,8 @@ class AdminPanel:
         if not payment_url:
             await query.edit_message_text(
                 ERRORS["no_screenshot"],
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
+                reply_markup=create_button_layout([
+                    [create_button("back", f'manage_order_{order_id}', "Back to Order")]
                 ])
             )
             return
@@ -5498,8 +5610,8 @@ class AdminPanel:
             f"{EMOJI['screenshot']} Payment Screenshot for Order {order_id}:\n\n"
             f"Link: {payment_url}\n\n"
             "You can view the screenshot by clicking the link above.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
+            reply_markup=create_button_layout([
+                [create_button("back", f'manage_order_{order_id}', "Back to Order")]
             ])
         )
     
@@ -5532,7 +5644,7 @@ class AdminPanel:
         
         # Add back button
         keyboard.append([
-            InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')
+            create_button("back", f'manage_order_{order_id}', "Back to Order")
         ])
         
         self.loggers["admin"].info(f"Admin preparing to update status for order {order_id}")
@@ -5559,8 +5671,10 @@ class AdminPanel:
         
         if not order_id:
             await query.edit_message_text(
-                f"{EMOJI['error']} Error: No order selected."
-            )
+            reply_markup=create_button_layout([
+                [create_button("back", "back_to_admin", "Back to Admin Panel")]
+            ])
+        )
             return
         
         # Get the label for this status
@@ -5575,9 +5689,9 @@ class AdminPanel:
             await query.edit_message_text(
                 f"You're setting Order {order_id} to '{new_status}'.\n\n"
                 f"Would you like to add a tracking link?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Yes, Add Tracking Link", callback_data='add_tracking_link')],
-                    [InlineKeyboardButton("No, Skip Tracking Link", callback_data='skip_tracking_link')]
+                reply_markup=create_button_layout([
+                    [create_button("action", "add_tracking_link", "Yes, Add Tracking Link")],
+                    [create_button("action", "skip_tracking_link", "No, Skip Tracking Link")]
                 ])
             )
             return
@@ -5589,8 +5703,8 @@ class AdminPanel:
         
         if success:
             keyboard = [
-                [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                [create_button("action", f'manage_order_{order_id}', "View Order Details")],
+                [create_button("back", "view_orders", "Back to Orders")]
             ]
             
             await query.edit_message_text(
@@ -5600,8 +5714,8 @@ class AdminPanel:
         else:
             await query.edit_message_text(
                 ERRORS["update_failed"].format(order_id),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                reply_markup=create_button_layout([
+                    [create_button("back", "view_orders", "Back to Orders")]
                 ])
             )
     
@@ -5633,8 +5747,8 @@ class AdminPanel:
             f"Please send the tracking link for Order {order_id} as a message.\n\n"
             f"Example: https://share.lalamove.com/...\n\n"
             f"Type 'skip' to continue without adding a link.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Cancel", callback_data=f'manage_order_{order_id}')]
+            reply_markup=create_button_layout([
+                [create_button("cancel", f'manage_order_{order_id}', "Cancel")]
             ])
         )
         
@@ -5692,13 +5806,13 @@ class AdminPanel:
             
             if success:
                 keyboard = [
-                    [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                    [create_button("action", f'manage_order_{order_id}', "View Order Details")],
+                    [create_button("back", "view_orders", "Back to Orders")]
                 ]
                 
                 await update.message.reply_text(
                     MESSAGES["tracking_updated"].format(order_id),
-                    reply_markup=InlineKeyboardMarkup(keyboard)
+                    reply_markup=create_button_layout(keyboard)
                 )
             else:
                 await update.message.reply_text(ERRORS["update_failed"].format(order_id))
@@ -5718,13 +5832,13 @@ class AdminPanel:
             
             if success:
                 keyboard = [
-                    [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                    [create_button("action", f'manage_order_{order_id}', "View Order Details")],
+                    [create_button("back", "view_orders", "Back to Orders")]
                 ]
                 
                 await update.message.reply_text(
                     f"{MESSAGES['status_updated'].format(new_status, order_id)} with tracking link.",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
+                    reply_markup=create_button_layout(keyboard)
                 )
             else:
                 await update.message.reply_text(ERRORS["update_failed"].format(order_id))
@@ -5755,8 +5869,8 @@ class AdminPanel:
             
             if success:
                 keyboard = [
-                    [InlineKeyboardButton("View Order Details", callback_data=f'manage_order_{order_id}')],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                    [create_button("action", f'manage_order_{order_id}', "View Order Details")],
+                    [create_button("back", "view_orders", "Back to Orders")]
                 ]
                 
                 await query.edit_message_text(
@@ -5766,16 +5880,16 @@ class AdminPanel:
             else:
                 await query.edit_message_text(
                     ERRORS["update_failed"].format(order_id),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"{EMOJI['back']} Back to Orders", callback_data='view_orders')]
+                    reply_markup=create_button_layout([
+                        [create_button("back", "view_orders", "Back to Orders")]
                     ])
                 )
         else:
             # Direct tracking link update was cancelled
             await query.edit_message_text(
                 f"Tracking link update cancelled for Order {order_id}.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Order", callback_data=f'manage_order_{order_id}')]
+                reply_markup=create_button_layout([
+                    [create_button("back", f'manage_order_{order_id}', "Back to Order")]
                 ])
             )
             
@@ -6436,8 +6550,6 @@ async def check_conversation_status(context: ContextTypes.DEFAULT_TYPE):
                     loggers["errors"].error(f"Failed to send recovery message to user {user_id}: {e}")
 
 # ---------------------------- Bot Recovery & Support Functions ----------------------------
-# Replace the restart_conversation function around line 4685
-
 # Global start command handler that works regardless of conversation state
 async def global_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -6582,10 +6694,10 @@ async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
                       f"Your session has been reset and you can start fresh. " \
                       f"Use the menu below to continue."
     
-    reply_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{EMOJI['browse']} Browse Products", callback_data="start_shopping")],
-        [InlineKeyboardButton(f"{EMOJI['order']} Track Order", callback_data="track_order")],
-        [InlineKeyboardButton(f"{EMOJI['help']} Help", callback_data="get_help")]
+    reply_markup = create_button_layout([
+        create_button("action", "start_shopping", f"{EMOJI['browse']} Browse Products"),
+        create_button("action", "track_order", f"{EMOJI['order']} Track Order"),
+        create_button("action", "get_help", f"{EMOJI['help']} Help")
     ])
     
     if query:
