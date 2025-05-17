@@ -3,19 +3,21 @@
 All-in-one Telegram bot for Ganja Paraiso cannabis store.
 Handles product ordering, order tracking, payment processing, and admin management.
 """
-import re
-import time
-import random
 import asyncio
+import json
 import logging
 import os
+import pickle
+import random
+import re
+import shutil
 import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
 from io import BytesIO
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from collections import deque
-import string
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable
 
 # Import Telegram components
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
@@ -349,14 +351,19 @@ RATE_LIMITS = {
     "order": 10,    # Max 10 orders per hour
     "payment": 15,  # Max 15 payment uploads per hour
     "track": 30,    # Max 30 tracking requests per hour
-    "admin": 50     # Max 50 admin actions per hour
+    "admin": 50,     # Max 50 admin actions per hour
+    "checkout": {"limit": 10, "window": 3600},  # 10 checkouts per hour
+    "verify": {"limit": 20, "window": 3600},  # 20 verifications per hour
+    "global": {"limit": 100, "window": 3600},  # 100 actions per hour
 }
 
 # ---------------------------- Cache Configuration ----------------------------
 CACHE_EXPIRY = {
     "inventory": 300,     # 5 minutes
     "order_status": 60,   # 1 minute
-    "customer_info": 600  # 10 minutes
+    "customer_info": 600,  # 10 minutes
+    "sheets": 120,     # 2 minutes
+    "drive": 600,      # 10 minutes
 }
 
 # ---------------------------- Default Values ----------------------------
@@ -736,31 +743,31 @@ def log_admin_action(logger, admin_id, action, order_id=None):
 class GoogleAPIsManager:
     """Manage Google API connections with rate limiting, backoff, and enhanced caching."""
     
-    def __init__(self, loggers):
+    def __init__(self, loggers: Dict[str, logging.Logger]) -> None:
         """
         Initialize the Google APIs Manager.
         
         Args:
-            loggers (dict): Dictionary of logger instances
+            loggers: Dictionary of logger instances
         """
         self.loggers = loggers
-        self.last_request_time = {}
-        self.min_request_interval = 1.0  # Minimum seconds between requests
+        self.last_request_time: Dict[str, float] = {}
+        self.min_request_interval: float = 1.0  # Minimum seconds between requests
         self._sheet_client = None
         self._drive_service = None
         self._sheet = None
         self._inventory_sheet = None
-        self._sheet_initialized = False
+        self._sheet_initialized: bool = False
         
         # Enhanced cache system
-        self.cache = {
+        self.cache: Dict[str, Dict[str, Any]] = {
             "inventory": {"data": None, "timestamp": 0},
             "orders": {"data": None, "timestamp": 0},
             "sheets": {"data": None, "timestamp": 0},
             "drive": {"data": None, "timestamp": 0}
         }
-        self.cache_hits = 0
-        self.cache_misses = 0
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
         
     async def get_sheet_client(self):
         """
@@ -1250,15 +1257,25 @@ class GoogleAPIsManager:
         }
 
 # ---------------------------- Utility Functions ----------------------------
-def is_valid_order_id(order_id):
+def is_valid_order_id(order_id: str) -> bool:
     """
     Validate the format of an order ID with enhanced security checks.
     
+    This function ensures that order IDs follow the expected format (WW-XXXX-YYY)
+    and helps prevent injection attacks or invalid queries. Uses the validate_sensitive_data
+    function with specific order ID validation rules.
+    
     Args:
-        order_id (str): Order ID to validate
+        order_id: Order ID to validate
         
     Returns:
-        bool: True if valid, False otherwise
+        bool: True if the order ID is valid, False otherwise
+        
+    Example:
+        >>> is_valid_order_id("WW-1234-ABC")
+        True
+        >>> is_valid_order_id("INVALID")
+        False
     """
     valid, _ = validate_sensitive_data('order_id', order_id)
     return valid
@@ -1669,16 +1686,16 @@ def check_rate_limit(context, user_id, action_type):
     data["count"] += 1
     return data["count"] <= max_actions
 
-def get_user_session(context, user_id):
+def get_user_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Dict[str, Any]:
     """
     Get or create a user session.
     
     Args:
         context: The conversation context
-        user_id (int): User's Telegram ID
+        user_id: User's Telegram ID
         
     Returns:
-        dict: User session data
+        Dict[str, Any]: User session data
     """
     if "sessions" not in context.bot_data:
         context.bot_data["sessions"] = {}
@@ -2053,88 +2070,55 @@ async def retry_operation(operation, operation_name=None, max_retries=3):
 
 # ---------------------------- Inventory Management ----------------------------
 class InventoryManager:
-    """Manages product inventory and caching with stock tracking."""
+    """
+    Manage product inventory with caching and efficient access patterns.
+    """
     
-    def __init__(self, google_apis, loggers):
+    def __init__(self, google_apis, loggers: Dict[str, logging.Logger]) -> None:
         """
         Initialize the inventory manager.
         
         Args:
-            google_apis: GoogleAPIsManager instance for data access
-            loggers: Dictionary of logger instances for error reporting
+            google_apis: Google APIs manager instance
+            loggers: Dictionary of logger instances
         """
         self.google_apis = google_apis
         self.loggers = loggers
-        self.cache = {
-            "products_by_tag": None,
-            "products_by_strain": None,
-            "all_products": None,
-            "last_update": 0
-        }
+        self._inventory_cache: Dict[str, Any] = {}
+        self._last_refresh: float = 0
+        self._cache_ttl: int = 300  # 5 minutes
         
-    async def get_inventory(self, force_refresh=False):
+    async def get_inventory(self, force_refresh: bool = False) -> Tuple[Dict[str, List[Dict]], Dict[str, List[Dict]], List[Dict]]:
         """
-        Get inventory data with caching to minimize API calls.
+        Get product inventory data with caching.
         
         Args:
-            force_refresh (bool): Force refresh the cache regardless of age
+            force_refresh: Force refresh the cache regardless of age
             
         Returns:
             tuple: (products_by_tag, products_by_strain, all_products)
         """
-        current_time = time.time()
-        cache_valid = (
-            self.cache["products_by_tag"] is not None and
-            self.cache["products_by_strain"] is not None and
-            self.cache["all_products"] is not None and
-            current_time - self.cache["last_update"] < CACHE_EXPIRY["inventory"]
-        )
+        now = time.time()
         
-        if cache_valid and not force_refresh:
-            return (
-                self.cache["products_by_tag"],
-                self.cache["products_by_strain"],
-                self.cache["all_products"]
-            )
-            
-        try:
+        # Check if we need to refresh the cache
+        if force_refresh or not self._inventory_cache or now - self._last_refresh > self._cache_ttl:
             # Fetch fresh inventory data
             products_by_tag, products_by_strain, all_products = await self.google_apis.fetch_inventory()
             
             # Update cache
-            self.cache["products_by_tag"] = products_by_tag
-            self.cache["products_by_strain"] = products_by_strain
-            self.cache["all_products"] = all_products
-            self.cache["last_update"] = current_time
+            self._inventory_cache = {
+                "products_by_tag": products_by_tag,
+                "products_by_strain": products_by_strain,
+                "all_products": all_products
+            }
+            self._last_refresh = now
             
-            self.loggers["main"].info("Inventory cache refreshed")
-            return products_by_tag, products_by_strain, all_products
-            
-        except Exception as e:
-            self.loggers["errors"].error(f"Error refreshing inventory: {str(e)}")
-            
-            # If we have cached data, use it despite expiry
-            if (self.cache["products_by_tag"] and 
-                self.cache["products_by_strain"] and 
-                self.cache["all_products"]):
-                self.loggers["main"].warning("Using expired inventory cache")
-                return (
-                    self.cache["products_by_tag"],
-                    self.cache["products_by_strain"],
-                    self.cache["all_products"]
-                )
-                
-            # Build fallback inventory
-            self.loggers["main"].warning("Using fallback inventory")
-            products_by_tag, products_by_strain, all_products = self.google_apis._create_default_inventory()
-            
-            # Cache the fallback inventory
-            self.cache["products_by_tag"] = products_by_tag
-            self.cache["products_by_strain"] = products_by_strain
-            self.cache["all_products"] = all_products
-            self.cache["last_update"] = current_time
-            
-            return products_by_tag, products_by_strain, all_products
+        # Return cached data
+        return (
+            self._inventory_cache.get("products_by_tag", {}),
+            self._inventory_cache.get("products_by_strain", {}),
+            self._inventory_cache.get("all_products", [])
+        )
         
     async def get_inventory_safe(self, force_refresh=False):
         """
@@ -2569,10 +2553,38 @@ class OrderManager:
         return status, tracking_link, order_details
     
 # ---------------------------- Order Handlers ----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
+
+# ==========================================================================
+# CONVERSATION HANDLERS
+# ==========================================================================
+# The following functions handle the conversation flow for the bot.
+# Each function corresponds to a state in the conversation FSM.
+# 
+# General handler pattern:
+# 1. Extract information from user input
+# 2. Validate input and handle errors
+# 3. Update user data/state
+# 4. Respond to user
+# 5. Return next conversation state
+# ==========================================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                inventory_manager: InventoryManager, 
+                loggers: Dict[str, logging.Logger]) -> int:
     """
     Start the ordering conversation with available categories.
     Enhanced with better UX and user guidance.
+    
+    This function initializes a new order conversation, checks inventory
+    for available categories, and presents them to the user in a
+    formatted message with emoji-enhanced buttons.
+    
+    Flow:
+    1. Initialize user cart
+    2. Check rate limits
+    3. Log conversation start
+    4. Create welcome message
+    5. Check available categories from inventory
+    6. Display category selection buttons
     
     Args:
         update: Telegram update
@@ -2581,7 +2593,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_ma
         loggers: Dictionary of logger instances
         
     Returns:
-        int: Next conversation state
+        int: Next conversation state (CATEGORY)
     """
     user = update.message.from_user
     first_name = user.first_name if user.first_name else "there"
@@ -6494,6 +6506,105 @@ async def back_to_categories_wrapper(update: Update, context: ContextTypes.DEFAU
     return await back_to_categories(update, context, inventory_manager, loggers)
 
 # ---------------------------- Bot Setup ----------------------------
+
+# ==========================================================================
+# DEBUGGING AND DIAGNOSTIC FUNCTIONS
+# ==========================================================================
+
+def memory_usage_report() -> Dict[str, Union[int, float]]:
+    """
+    Get a report of current memory usage.
+    
+    Returns:
+        Dict[str, Union[int, float]]: Memory usage statistics
+    """
+    import psutil
+    import gc
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Get current process
+    process = psutil.Process(os.getpid())
+    
+    # Get memory info
+    memory_info = process.memory_info()
+    
+    return {
+        "rss": memory_info.rss / 1024 / 1024,  # RSS in MB
+        "vms": memory_info.vms / 1024 / 1024,  # VMS in MB
+        "percent": process.memory_percent(),
+        "num_threads": process.num_threads(),
+        "open_files": len(process.open_files()),
+    }
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Admin command to get debugging information.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    user_id = update.effective_user.id
+    
+    # Only allow the admin to use this command
+    if user_id != ADMIN_ID:
+        await update.message.reply_text(ERRORS["not_authorized"])
+        return
+        
+    try:
+        # Get memory usage report
+        try:
+            mem_usage = memory_usage_report()
+            
+            # Format the report
+            report = BotResponse("debug") \
+                .add_header("Debug Information", "debug") \
+                .add_paragraph("System Status:") \
+                .add_bullet_list([
+                    f"Memory usage: {mem_usage['rss']:.2f} MB RSS",
+                    f"Memory percent: {mem_usage['percent']:.1f}%",
+                    f"Threads: {mem_usage['num_threads']}",
+                    f"Open files: {mem_usage['open_files']}",
+                    f"Persistence file: {get_persistence_file_size():.2f} MB",
+                    f"Uptime: {time.time() - context.bot_data.get('start_time', time.time()):.1f} seconds",
+                ])
+                
+            # Add cache stats if available
+            try:
+                cache_stats = google_apis.get_cache_stats()
+                report.add_paragraph("Cache Statistics:") \
+                    .add_bullet_list([
+                        f"Hit ratio: {cache_stats['hit_ratio']:.1%}",
+                        f"Cache hits: {cache_stats['cache_hits']}",
+                        f"Cache misses: {cache_stats['cache_misses']}",
+                        f"Total requests: {cache_stats['total_requests']}",
+                    ])
+            except Exception:
+                pass
+                
+            # Add active user count
+            active_users = 0
+            if "sessions" in context.bot_data:
+                active_users = len(context.bot_data["sessions"])
+                
+            report.add_paragraph("User Statistics:") \
+                .add_bullet_list([
+                    f"Active users: {active_users}",
+                ])
+                
+            # Send the report
+            await update.message.reply_text(report.get_message())
+                
+        except ImportError:
+            await update.message.reply_text(
+                f"{EMOJI['error']} Debug module not available. Please install psutil."
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"{EMOJI['error']} Error generating debug report: {str(e)}"
+        )
 def main():
     """Set up the bot and start polling."""
     global loggers, google_apis, inventory_manager, order_manager, admin_panel
@@ -6548,6 +6659,7 @@ def main():
         app.add_handler(CommandHandler("support", support_command))
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("?", contextual_help))  # Short command for contextual help
+        app.add_handler(CommandHandler("debug", debug_command))  # Debug command for admin
         app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
         app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
         # Updated with more specific pattern
