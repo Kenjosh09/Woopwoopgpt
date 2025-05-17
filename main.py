@@ -920,9 +920,17 @@ class GoogleAPIsManager:
 
 # ---------------------------- Utility Functions ----------------------------
 def is_valid_order_id(order_id):
-    """Validate the format of an order ID."""
-    # Check for valid order ID pattern (WW-XXXX-YYY format)
-    return bool(order_id and re.match(r'^WW-\d{4}-[A-Z]{3}$', order_id))
+    """
+    Validate the format of an order ID with enhanced security checks.
+    
+    Args:
+        order_id (str): Order ID to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    valid, _ = validate_sensitive_data('order_id', order_id)
+    return valid
 
 def get_user_orders(user_id):
     """Get a list of orders for a specific user."""
@@ -1051,7 +1059,7 @@ def manage_cart(context, action, item=None):
 
 def sanitize_input(text, max_length=100):
     """
-    Sanitize user input to prevent injection attacks.
+    Sanitize user input to prevent injection attacks and ensure data quality.
     
     Args:
         text (str): Text to sanitize
@@ -1063,14 +1071,64 @@ def sanitize_input(text, max_length=100):
     if not text:
         return ""
         
-    # Remove any HTML or unwanted characters
-    sanitized = re.sub(r'<[^>]*>', '', text)
+    # Remove any HTML or unwanted characters - use a more comprehensive pattern
+    sanitized = re.sub(r'<[^>]*>|[^\w\s,.!?@:;()\-_\/]', '', text)
+    
+    # Trim whitespace
+    sanitized = sanitized.strip()
     
     # Limit length
     if len(sanitized) > max_length:
         sanitized = sanitized[:max_length]
         
     return sanitized
+
+def validate_sensitive_data(data_type, value):
+    """
+    Validate sensitive user data against specific patterns.
+    
+    Args:
+        data_type (str): Type of data being validated ('name', 'address', 'phone', etc.)
+        value (str): Value to validate
+        
+    Returns:
+        tuple: (is_valid, error_message or sanitized_value)
+    """
+    # First sanitize the input
+    value = sanitize_input(value, max_length=200)
+    
+    if data_type == 'name':
+        # Name should only contain letters, spaces, and basic punctuation
+        if not re.match(r'^[\w\s.,\'-]{2,50}$', value):
+            return False, "Name contains invalid characters or is too short/long."
+        return True, value
+        
+    elif data_type == 'address':
+        # Address should have minimum length and contain some numbers and letters
+        if len(value) < 10:
+            return False, "Address is too short. Please provide a complete address."
+        if not (re.search(r'\d', value) and re.search(r'[a-zA-Z]', value)):
+            return False, "Address should contain both numbers and letters."
+        return True, value
+        
+    elif data_type == 'phone':
+        # Phone number validation - allow different formats but ensure it has enough digits
+        # Remove all non-digit characters first
+        digits = re.sub(r'\D', '', value)
+        if len(digits) < 10 or len(digits) > 15:
+            return False, "Phone number should have 10-15 digits."
+        # Format the phone number consistently
+        formatted = digits
+        return True, formatted
+        
+    elif data_type == 'order_id':
+        # Validate order ID format (WW-XXXX-YYY)
+        if not re.match(r'^WW-\d{4}-[A-Z]{3}$', value):
+            return False, "Invalid order ID format. Should be like WW-1234-ABC."
+        return True, value
+    
+    # Default case
+    return True, value
 
 def validate_quantity(text, category=None):
     """
@@ -1113,10 +1171,7 @@ def validate_quantity(text, category=None):
 
 def validate_shipping_details(text):
     """
-    Validate shipping details format with enhanced flexibility.
-    
-    This function checks if the user's shipping details input follows the correct format,
-    while allowing for more flexibility in names, addresses and contact information.
+    Validate shipping details format with enhanced flexibility and security.
     
     Args:
         text (str): Shipping details text in format "Name / Address / Contact"
@@ -1124,8 +1179,8 @@ def validate_shipping_details(text):
     Returns:
         tuple: (is_valid, result_dict_or_error_message)
     """
-    # Log the input for debugging
-    logging.debug(f"Validating shipping details: {text}")
+    # Log the input for debugging without exposing full details
+    logging.debug(f"Validating shipping details (length: {len(text)})")
     
     # Basic format check - need two slashes to have three parts
     if text.count('/') != 2:
@@ -1140,28 +1195,24 @@ def validate_shipping_details(text):
         
     name, address, contact = parts
     
-    # Check each part
-    if not name:
-        return False, "Name cannot be empty. Format: Name / Address / Contact"
-    if not address:
-        return False, "Address cannot be empty. Format: Name / Address / Contact"
-        
-    # Simplified contact validation - just ensure it has enough digits
-    # Count only digits
-    digit_count = sum(c.isdigit() for c in contact)
-    if digit_count < 10 or digit_count > 15:
-        return False, "Invalid contact number. Must have 10-15 digits. Can include +, spaces, or hyphens."
+    # Validate each part using our enhanced validators
+    name_valid, name_result = validate_sensitive_data('name', name)
+    if not name_valid:
+        return False, f"Name validation failed: {name_result}"
     
-    # Sanitize the inputs
-    name = sanitize_input(name, 50)
-    address = sanitize_input(address, 100)
-    contact = sanitize_input(contact, 15)
+    address_valid, address_result = validate_sensitive_data('address', address)
+    if not address_valid:
+        return False, f"Address validation failed: {address_result}"
+    
+    phone_valid, phone_result = validate_sensitive_data('phone', contact)
+    if not phone_valid:
+        return False, f"Contact number validation failed: {phone_result}"
     
     # Success - return the validated details
     return True, {
-        "name": name,
-        "address": address,
-        "contact": contact
+        "name": name_result,
+        "address": address_result,
+        "contact": phone_result
     }
 
 def check_rate_limit(context, user_id, action_type):
