@@ -188,7 +188,8 @@ EMOJI = {
     "truck": "🚚",
     "party": "🎉",
     "support": "🧑‍💼",
-    "alert": "🚨"  # Added missing alert emoji
+    "alert": "🚨",
+    'home': '🏠',
 }
 
 # ---------------------------- Product Dictionary ----------------------------
@@ -919,47 +920,79 @@ class GoogleAPIsManager:
         Returns:
             tuple: (orders_sheet, inventory_sheet)
         """
-        if self._sheet_initialized:
+        if self._sheet_initialized and self._sheet and self._inventory_sheet:
             return self._sheet, self._inventory_sheet
             
         try:
             # Make a rate-limited request
             await self._rate_limit_request('sheets')
             
-            # Get the spreadsheet
+            # Get the spreadsheet with enhanced error handling
             client = await self.get_sheet_client()
-            spreadsheet = client.open(GOOGLE_SHEET_NAME)
+            if not client:
+                self.loggers["errors"].error("Failed to get sheet client")
+                return None, None
+                
+            print("DEBUG SHEETS: Got sheet client, opening spreadsheet")
+            
+            try:
+                spreadsheet = client.open(GOOGLE_SHEET_NAME)
+            except Exception as sheet_err:
+                self.loggers["errors"].error(f"Failed to open spreadsheet: {str(sheet_err)}")
+                print(f"DEBUG SHEETS: Error opening spreadsheet: {str(sheet_err)}")
+                return None, None
             
             # Get or create the main orders sheet
             try:
                 self._sheet = spreadsheet.sheet1
-            except:
-                self._sheet = spreadsheet.add_worksheet("Orders", 1000, 20)
+                print("DEBUG SHEETS: Successfully accessed orders sheet")
+            except Exception as orders_err:
+                self.loggers["errors"].error(f"Error accessing orders sheet: {str(orders_err)}")
+                try:
+                    print("DEBUG SHEETS: Creating orders sheet")
+                    self._sheet = spreadsheet.add_worksheet("Orders", 1000, 20)
+                except Exception as create_err:
+                    self.loggers["errors"].error(f"Error creating orders sheet: {str(create_err)}")
+                    return None, None
             
             # Get or create the inventory sheet
             try:
                 self._inventory_sheet = spreadsheet.worksheet("Inventory")
-            except:
-                self._inventory_sheet = spreadsheet.add_worksheet("Inventory", 100, 10)
-                # Initialize inventory headers with new columns
-                self._inventory_sheet.append_row([
-                    "Name", "Strain", "Type", "Tag", "Price", "Stock", 
-                    "Weight", "Brand", "Description", "Image_URL"
-                ])
+                print("DEBUG SHEETS: Successfully accessed inventory sheet")
+            except Exception as inv_err:
+                self.loggers["errors"].error(f"Error accessing inventory sheet: {str(inv_err)}")
+                try:
+                    print("DEBUG SHEETS: Creating inventory sheet")
+                    self._inventory_sheet = spreadsheet.add_worksheet("Inventory", 100, 10)
+                    # Initialize inventory headers with new columns
+                    self._inventory_sheet.append_row([
+                        "Name", "Strain", "Type", "Tag", "Price", "Stock", 
+                        "Weight", "Brand", "Description", "Image_URL"
+                    ])
+                except Exception as create_err:
+                    self.loggers["errors"].error(f"Error creating inventory sheet: {str(create_err)}")
+                    # We can continue with just the orders sheet if needed
             
             # Ensure the orders sheet has the correct headers
-            current_headers = self._sheet.row_values(1)
-            if not current_headers or len(current_headers) < len(SHEET_HEADERS):
-                self._sheet.update("A1", [SHEET_HEADERS])
+            try:
+                current_headers = self._sheet.row_values(1)
+                if not current_headers or len(current_headers) < len(SHEET_HEADERS):
+                    print("DEBUG SHEETS: Setting up sheet headers")
+                    self._sheet.update("A1", [SHEET_HEADERS])
+            except Exception as header_err:
+                self.loggers["errors"].error(f"Error setting sheet headers: {str(header_err)}")
+                # We can still try to continue if headers exist
             
             self._sheet_initialized = True
+            print("DEBUG SHEETS: Sheets successfully initialized")
             return self._sheet, self._inventory_sheet
             
         except Exception as e:
             self.loggers["errors"].error(f"Failed to initialize sheets: {e}")
             # Return None or provide fallback behavior
+            print(f"DEBUG SHEETS: Fatal error initializing sheets: {str(e)}")
             return None, None
-        
+                
     def _check_cache(self, cache_key, cache_type="inventory", max_age=None):
         """
         Check if cached data exists and is still valid.
@@ -1209,13 +1242,199 @@ class GoogleAPIsManager:
             raise RuntimeError(f"Failed to upload payment screenshot: {e}") from e
     
     async def add_order_to_sheet(self, order_data):
-        # ... existing method remains the same ...
-        pass
-    
+        """
+        Add a new order to the Google Sheet.
+        
+        Args:
+            order_data: List of order values to add to sheet
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            # Initialize the sheets if not already done
+            sheet, _ = await self.initialize_sheets()
+            if not sheet:
+                self.loggers["errors"].error("Failed to initialize sheet for adding order")
+                return False
+                
+            # Make a rate-limited request
+            await self._rate_limit_request('sheets_write')
+            
+            # Debug print the order data length
+            print(f"DEBUG SHEET: Adding order with {len(order_data)} columns to sheet")
+            
+            # Check if row has correct number of columns
+            expected_columns = len(SHEET_HEADERS)
+            if len(order_data) != expected_columns:
+                # Adjust the order data to match expected columns
+                if len(order_data) < expected_columns:
+                    # Add empty strings to fill missing columns
+                    order_data.extend([""] * (expected_columns - len(order_data)))
+                else:
+                    # Truncate extra columns
+                    order_data = order_data[:expected_columns]
+                
+                print(f"DEBUG SHEET: Adjusted order data to {len(order_data)} columns")
+            
+            # Find the next empty row
+            try:
+                # Get all values in first column
+                col_a = sheet.col_values(1)
+                # Next row is one more than the length
+                next_row = len(col_a) + 1
+            except Exception as row_err:
+                self.loggers["errors"].error(f"Error finding next row: {str(row_err)}")
+                # Default to append as fallback
+                next_row = None
+            
+            # Use RetryableOperation for robust error handling
+            retry_handler = RetryableOperation(
+                self.loggers, 
+                max_retries=3,
+                retry_on=(ConnectionError, TimeoutError, BrokenPipeError)
+            )
+            
+            # Define the add operation
+            async def add_to_sheet():
+                if next_row:
+                    # If we know the next row, insert there
+                    sheet.insert_row(order_data, next_row)
+                else:
+                    # Otherwise just append
+                    sheet.append_row(order_data)
+                return True
+            
+            # Try adding with retries
+            success = await retry_handler.run(
+                add_to_sheet,
+                operation_name="add_order_to_sheet"
+            )
+            
+            # Update cache
+            if success:
+                # Invalidate orders cache
+                if 'orders' in self.caches:
+                    self.caches['orders'].clear()
+            
+            return success
+            
+        except Exception as e:
+            self.loggers["errors"].error(f"Failed to add order to sheet: {str(e)}")
+            return False
+
     async def update_order_status(self, order_id, new_status, tracking_link=None):
-        # ... existing method remains the same ...
-        pass
-    
+        """
+        Update the status and optional tracking link for an existing order.
+        
+        Args:
+            order_id (str): Order ID to update
+            new_status (str): New status to set for the order
+            tracking_link (str, optional): Tracking link to add to the order
+            
+        Returns:
+            tuple: (success, customer_id) - Success status and customer Telegram ID for notifications
+        """
+        try:
+            # Initialize the sheets if needed
+            sheet, _ = await self.initialize_sheets()
+            if not sheet:
+                self.loggers["errors"].error(f"Failed to initialize sheets for updating order {order_id}")
+                return False, None
+                
+            # Make a rate-limited request
+            await self._rate_limit_request('sheets_write')
+            
+            # Find the order by ID
+            all_orders = sheet.get_all_records()
+            
+            # Debug logging
+            print(f"DEBUG STATUS: Updating order {order_id} to status: {new_status}")
+            
+            # Track if we found and updated the order
+            found_order = False
+            customer_id = None
+            
+            # Process the orders
+            for idx, order in enumerate(all_orders):
+                # Look for the main order entry with matching ID
+                if 'Order ID' in order and order['Order ID'] == order_id:
+                    if 'Product' in order and order['Product'] == "COMPLETE ORDER":
+                        # This is our main order row
+                        found_order = True
+                        
+                        # Extract customer ID for notifications
+                        if 'Telegram ID' in order:
+                            try:
+                                customer_id = int(order['Telegram ID'])
+                            except (ValueError, TypeError):
+                                customer_id = None
+                        
+                        # Calculate the row number (add 2: 1 for header, 1 for 0-indexing)
+                        row_number = idx + 2
+                        
+                        # Define what to update
+                        updates = {
+                            'Status': new_status  # Always update status
+                        }
+                        
+                        # Add tracking link if provided
+                        if tracking_link:
+                            updates['Tracking Link'] = tracking_link
+                        
+                        # Perform updates with retry logic
+                        retry_handler = RetryableOperation(
+                            self.loggers, 
+                            max_retries=3,
+                            retry_on=(ConnectionError, TimeoutError, BrokenPipeError)
+                        )
+                        
+                        # Define the update operation
+                        async def update_sheet_cells():
+                            for field, value in updates.items():
+                                # Find the column index for this field
+                                if field in SHEET_COLUMN_INDICES:
+                                    col_idx = SHEET_COLUMN_INDICES[field]
+                                    # Update the cell
+                                    sheet.update_cell(row_number, col_idx, value)
+                                    # Small delay to avoid rate limits
+                                    await asyncio.sleep(0.5)
+                            return True
+                        
+                        # Execute with retries
+                        success = await retry_handler.run(
+                            update_sheet_cells,
+                            operation_name=f"update_order_status_{order_id}"
+                        )
+                        
+                        # Clear cache for this order
+                        cache_key = f"order_{order_id}"
+                        if 'orders' in self.caches:
+                            self.caches["orders"].clear(cache_key)
+                        
+                        # Log the result
+                        if success:
+                            self.loggers["main"].info(
+                                f"Updated order {order_id} status to '{new_status}'"
+                                f"{' with tracking' if tracking_link else ''}"
+                            )
+                        else:
+                            self.loggers["errors"].error(
+                                f"Failed to update sheet cells for order {order_id}"
+                            )
+                        
+                        # Return the result with customer ID for notifications
+                        return success, customer_id
+            
+            # If we reach here, we didn't find the order
+            if not found_order:
+                self.loggers["errors"].error(f"Order {order_id} not found for status update")
+                return False, None
+                
+        except Exception as e:
+            self.loggers["errors"].error(f"Error updating order status: {str(e)}")
+            return False, None
+        
     async def get_order_details(self, order_id):
         """
         Get details for a specific order with enhanced caching for frequent requests.
@@ -1261,8 +1480,57 @@ class GoogleAPIsManager:
             return None
     
     async def _rate_limit_request(self, api_name):
-        # ... existing method remains the same ...
-        pass
+        """
+        Rate limit requests to Google APIs to prevent quota issues.
+        
+        This method implements an adaptive rate limiting strategy that tracks
+        request timing and enforces appropriate delays between requests.
+        
+        Args:
+            api_name (str): Name of the API being accessed for tracking purposes
+        """
+        now = time.time()
+        
+        # Define minimum wait times for different API operations (in seconds)
+        min_wait_times = {
+            'sheets': 1.0,           # General sheets access
+            'sheets_read': 0.5,      # Read operations (less intensive)
+            'sheets_write': 1.2,     # Write operations (more intensive)
+            'drive': 1.5,            # Drive operations
+            'inventory': 0.8,        # Inventory fetches
+            'default': 1.0           # Default for any other operation
+        }
+        
+        # Get the appropriate wait time
+        min_wait = min_wait_times.get(api_name, min_wait_times['default'])
+        
+        # Check if we need to wait
+        last_request = self.last_request_time.get(api_name, 0)
+        time_since_last = now - last_request
+        
+        if time_since_last < min_wait:
+            # Calculate wait time with a small buffer
+            wait_time = min_wait - time_since_last + 0.1  # Add 0.1s buffer
+            
+            # Add jitter to prevent synchronized requests (±10%)
+            jitter = random.uniform(-0.1, 0.1) * wait_time
+            adjusted_wait = max(0.1, wait_time + jitter)  # Ensure at least a minimal wait
+            
+            # Wait the calculated time
+            await asyncio.sleep(adjusted_wait)
+        
+        # Update the last request time
+        self.last_request_time[api_name] = time.time()
+        
+        # If there are too many entries in last_request_time, clean it up
+        if len(self.last_request_time) > 20:
+            # Keep only the most recent APIs used
+            recent_apis = sorted(
+                self.last_request_time.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:10]
+            self.last_request_time = dict(recent_apis)
 
     def get_cache_stats(self):
         """
@@ -1733,6 +2001,22 @@ class EnhancedCache:
             "items": len(self.cache),
             "max_items": self.max_items
         }
+    
+    def clear(self, key=None):
+        """
+        Clear a specific key or the entire cache.
+        
+        Args:
+            key (str, optional): Specific key to clear, or None to clear all
+        """
+        if key:
+            if key in self.cache:
+                del self.cache[key]
+                if key in self.access_order:
+                    self.access_order.remove(key)
+        else:
+            self.cache.clear()
+            self.access_order.clear()
 
 class RetryableOperation:
     """
@@ -2498,82 +2782,125 @@ class OrderManager:
                 chat_id=user_data.get("telegram_id"),
                 text=f"{EMOJI['info']} Processing your order... Please wait a moment."
             )
-        except Exception:
+        except Exception as msg_err:
             # Continue even if we can't send this message
+            self.loggers["errors"].error(f"Failed to send processing message: {str(msg_err)}")
             pass
             
-        # Generate order ID
-        order_id = generate_order_id()
-        
-        # Get current timestamp
-        current_date = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        
-        # Get user details
-        name = user_data.get("name", "Unknown")
-        address = user_data.get("address", "Unknown")
-        contact = user_data.get("contact", "Unknown")
-        telegram_id = user_data.get("telegram_id", 0)
-        
-        # Get cart items
-        cart = user_data.get("cart", [])
-        total_price = sum(item.get("total_price", 0) for item in cart)
-        
-        if not cart:
-            self.loggers["errors"].error(f"Attempted to create order with empty cart for user {telegram_id}")
+        try:
+            # Generate order ID
+            order_id = generate_order_id()
             
-            # Update status message if it was sent
+            # Get current timestamp
+            current_date = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            
+            # Get user details
+            name = user_data.get("name", "Unknown")
+            address = user_data.get("address", "Unknown")
+            contact = user_data.get("contact", "Unknown")
+            telegram_id = user_data.get("telegram_id", 0)
+            
+            # Get cart items
+            cart = user_data.get("cart", [])
+            total_price = sum(item.get("total_price", 0) for item in cart)
+            
+            # Verify we have required data
+            if not cart:
+                self.loggers["errors"].error(f"Attempted to create order with empty cart for user {telegram_id}")
+                
+                # Update status message if it was sent
+                if status_message:
+                    try:
+                        await status_message.edit_text(f"{EMOJI['error']} Error: Your cart is empty. Please add items before ordering.")
+                    except Exception:
+                        pass
+                        
+                return None, False
+            
+            if not telegram_id or telegram_id == 0:
+                self.loggers["errors"].error(f"Missing telegram_id for order with name: {name}")
+                
+                # Update status message if it was sent
+                if status_message:
+                    try:
+                        await status_message.edit_text(f"{EMOJI['error']} Error: Missing user identification. Please restart the ordering process.")
+                    except Exception:
+                        pass
+                        
+                return None, False
+            
+            # Format cart items in a single cell with bullet points
+            cart_summary = ""
+            for idx, item in enumerate(cart, 1):
+                product = item.get("suboption", "Unknown")
+                category = item.get("category", "Unknown")
+                quantity = item.get("quantity", 0)
+                unit = item.get("unit", "gram/s")
+                item_price = item.get("total_price", 0)
+                
+                # Add each item with bullet points
+                cart_summary += f"• {quantity}x {category} ({product}): {unit} ₱{item_price:,.2f}\n"
+            
+            # Debug logging
+            self.loggers["main"].info(f"Creating order with ID {order_id} for user {telegram_id}")
+            print(f"DEBUG ORDER: Creating order {order_id} for user {telegram_id} with {len(cart)} items")
+            
+            # Create order data row
+            order_data = [
+                order_id,                    # Order ID
+                telegram_id,                 # Telegram ID
+                name,                        # Name
+                address,                     # Address
+                contact,                     # Contact
+                "COMPLETE ORDER",            # Product (marks this as main order)
+                len(cart),                   # Quantity (number of items)
+                f"₱{total_price:,.2f}",      # Price
+                STATUS["pending_payment"]["label"], # Initial status
+                payment_url or "",           # Payment URL
+                current_date,                # Order date
+                cart_summary.strip()         # Notes (cart summary)
+            ]
+            
+            # Check data validity
+            if not all([order_id, name, address, contact, cart_summary]):
+                self.loggers["errors"].error(f"Invalid order data for user {telegram_id}")
+                return None, False
+            
+            # Update status message with progress
             if status_message:
                 try:
-                    await status_message.edit_text(f"{EMOJI['error']} Error: Your cart is empty. Please add items before ordering.")
+                    await status_message.edit_text(f"{EMOJI['info']} Saving your order... Almost done!")
                 except Exception:
                     pass
-                    
-            return None, False
-        
-        # Format cart items in a single cell with bullet points
-        cart_summary = ""
-        for idx, item in enumerate(cart, 1):
-            product = item.get("suboption", "Unknown")
-            category = item.get("category", "Unknown")
-            quantity = item.get("quantity", 0)
-            unit = item.get("unit", "gram/s")
-            item_price = item.get("total_price", 0)
             
-            # Add each item with bullet points
-            cart_summary += f"• {quantity}x {category} ({product}): {unit} ₱{item_price:,.2f}\n"
-        
-        # Create order data row
-        order_data = [
-            order_id,                    # Order ID
-            telegram_id,                 # Telegram ID
-            name,                        # Name
-            address,                     # Address
-            contact,                     # Contact
-            "COMPLETE ORDER",            # Product (marks this as main order)
-            len(cart),                   # Quantity (number of items)
-            f"₱{total_price:,.2f}",      # Price
-            STATUS["pending_payment"]["label"], # Initial status
-            payment_url or "",           # Payment URL
-            current_date,                # Order date
-            cart_summary.strip()         # Notes (cart summary)
-        ]
-        
-        # Update status message with progress
-        if status_message:
+            # Add to Google Sheet with enhanced error handling
             try:
-                await status_message.edit_text(f"{EMOJI['info']} Saving your order... Almost done!")
-            except Exception:
-                pass
-        
-        # Add to Google Sheet
-        success = await self.google_apis.add_order_to_sheet(order_data)
-        
-        if success:
-            # Update user session data
-            user_session = get_user_session(context, telegram_id)
-            user_session["order_count"] += 1
-            user_session["total_spent"] += total_price
-            user_session["last_order_id"] = order_id
+                # First ensure the sheets are initialized
+                sheet, _ = await self.google_apis.initialize_sheets()
+                if not sheet:
+                    self.loggers["errors"].error(f"Sheets not initialized for order {order_id}")
+                    return None, False
+                    
+                # Add the order with retries
+                success = await self.google_apis.add_order_to_sheet(order_data)
+                
+                if not success:
+                    self.loggers["errors"].error(f"Failed to add order {order_id} to sheet")
+                    return None, False
+                    
+            except Exception as sheet_error:
+                self.loggers["errors"].error(f"Error adding order to sheet: {str(sheet_error)}")
+                return None, False
+            
+            # Update user session data - if this is causing errors, handle it robustly
+            try:
+                user_session = get_user_session(context, telegram_id)
+                user_session["order_count"] = user_session.get("order_count", 0) + 1
+                user_session["total_spent"] = user_session.get("total_spent", 0) + total_price
+                user_session["last_order_id"] = order_id
+            except Exception as session_err:
+                # Just log it but continue with the order
+                self.loggers["errors"].error(f"Failed to update user session: {str(session_err)}")
             
             # Log the successful order creation
             self.loggers["orders"].info(
@@ -2589,8 +2916,11 @@ class OrderManager:
                     pass
                     
             return order_id, True
-        else:
-            self.loggers["errors"].error(f"Failed to create order for user {telegram_id}")
+            
+        except Exception as e:
+            # Detailed error logging
+            self.loggers["errors"].error(f"Exception creating order for user {user_data.get('telegram_id', 'Unknown')}: {str(e)}")
+            self.loggers["errors"].error(f"Exception type: {type(e).__name__}")
             
             # Update status message with error
             if status_message:
@@ -2600,7 +2930,8 @@ class OrderManager:
                     pass
                     
             return None, False
-    
+
+
     async def update_order_status(self, context, order_id, new_status, tracking_link=None):
         """
         Update an order's status and notify the customer.
@@ -3148,15 +3479,6 @@ async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """
     Handle strain type selection for products that require it.
     Enhanced with state tracking and robust error handling.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        inventory_manager: Inventory manager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        int: Next conversation state
     """
     # Track state for debugging
     await debug_state_tracking(update, context)
@@ -3167,6 +3489,24 @@ async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Log for debugging
     loggers["main"].info(f"Strain type selection callback received with data: {query.data}")
     print(f"DEBUG: Strain type selection with data: {query.data}")
+    
+    # Check if this callback was already processed (prevent duplicate processing)
+    callback_id = query.id
+    processed_callbacks = context.user_data.get("processed_callbacks", set())
+    
+    if callback_id in processed_callbacks:
+        print(f"DEBUG: Skipping already processed callback: {callback_id}")
+        return STRAIN_TYPE
+        
+    # Mark this callback as processed
+    processed_callbacks.add(callback_id)
+    context.user_data["processed_callbacks"] = processed_callbacks
+    
+    # Keep the size of processed_callbacks manageable
+    if len(processed_callbacks) > 100:
+        # Keep only the 50 most recent items
+        processed_callbacks = set(list(processed_callbacks)[-50:])
+        context.user_data["processed_callbacks"] = processed_callbacks
     
     if query.data == "back_to_categories":
         # Go back to category selection
@@ -3273,8 +3613,13 @@ async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
             # Log success and break if successful
             print(f"DEBUG: Successfully sent product selection keyboard on attempt {attempt+1}")
             break
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
+        except TelegramError as e:
+            # Check if this is a "message not modified" error
+            if "message is not modified" in str(e).lower():
+                # Message is identical, consider it successful
+                print(f"DEBUG: Message not modified (identical content)")
+                break
+            elif attempt == MAX_RETRIES - 1:
                 # This is our last attempt, log the failure and provide fallback
                 loggers["errors"].error(f"Failed to show strain products after {MAX_RETRIES} attempts: {e}")
                 
@@ -3446,15 +3791,6 @@ async def show_local_products(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle product selection after strain type or browse options.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
-        inventory_manager: Inventory manager instance
-        loggers: Dictionary of logger instances
-        
-    Returns:
-        int: Next conversation state
     """
     # Track state for debugging
     await debug_state_tracking(update, context)
@@ -3464,6 +3800,22 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     
     selection = query.data
     print(f"DEBUG PRODUCT: Product selection callback with data: {selection}")
+    
+    # Check if this callback was already processed
+    callback_id = query.id
+    processed_callbacks = context.user_data.get("processed_callbacks", set())
+    if callback_id in processed_callbacks:
+        print(f"DEBUG: Skipping already processed callback: {callback_id}")
+        return PRODUCT_SELECTION
+        
+    # Mark this callback as processed
+    processed_callbacks.add(callback_id)
+    context.user_data["processed_callbacks"] = processed_callbacks
+    
+    # Keep the size of processed_callbacks manageable
+    if len(processed_callbacks) > 100:
+        processed_callbacks = set(list(processed_callbacks)[-50:])
+        context.user_data["processed_callbacks"] = processed_callbacks
     
     # Handle back navigation
     if selection == "back_to_browse":
@@ -3557,22 +3909,25 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
                 [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
             ])
         )
-    except Exception as e:
+    except TelegramError as e:
         # Handle message editing errors
-        loggers["errors"].error(f"Error displaying product details: {e}")
-        # Try sending a new message instead
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"{EMOJI.get(category, '🌿')} {selected_product.get('name')}\n\n"
-                 f"Price: ₱{selected_product.get('price', 0):,.0f}\n"
-                 f"Stock: {selected_product.get('stock', 0)} {product_unit}\n\n"
-                 f"Please enter the quantity (minimum {min_order} {product_unit}):",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-            ])
-        )
-    
+        if "message is not modified" in str(e).lower():
+            print(f"DEBUG: Message not modified (identical content)")
+        else:
+            # Log other errors and try sending a new message
+            loggers["errors"].error(f"Error displaying product details: {e}")
+            # Try sending a new message instead
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"{EMOJI.get(category, '🌿')} {selected_product.get('name')}\n\n"
+                     f"Price: ₱{selected_product.get('price', 0):,.0f}\n"
+                     f"Stock: {selected_product.get('stock', 0)} {product_unit}\n\n"
+                     f"Please enter the quantity (minimum {min_order} {product_unit}):",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
+                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                ])
+            )    
     return QUANTITY
 
 async def handle_quantity_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
@@ -4207,6 +4562,7 @@ async def cancel_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
+# Around line 4210
 async def handle_payment_screenshot(
     update: Update, context: ContextTypes.DEFAULT_TYPE, 
     google_apis, order_manager, loggers
@@ -4236,8 +4592,14 @@ async def handle_payment_screenshot(
                 )
                 return PAYMENT
             
+            # First, send a processing message to indicate the bot is working
+            processing_msg = await update.message.reply_text(
+                f"{EMOJI['info']} Processing your payment screenshot and creating your order...\n"
+                f"This may take a moment, please wait."
+            )
+            
             # Download photo
-            photo = update.message.photo[-1]
+            photo = update.message.photo[-1]  # Get the largest photo
             file = await photo.get_file()
             file_bytes = await file.download_as_bytearray()
             
@@ -4255,13 +4617,43 @@ async def handle_payment_screenshot(
             user_name = context.user_data.get("name", "Unknown")
             filename = f"Order_{current_date}_{sanitize_input(user_name)}.jpg"
             
-            # Upload to Drive
-            file_url = await google_apis.upload_payment_screenshot(file_bytes, filename)
+            # Log progress for debugging
+            print(f"DEBUG: Uploading payment screenshot for user {user.id}")
+            loggers["main"].info(f"Processing payment screenshot for {user.id}")
+            
+            # Upload to Drive with extra error handling
+            try:
+                file_url = await google_apis.upload_payment_screenshot(file_bytes, filename)
+                print(f"DEBUG: Screenshot uploaded successfully, URL: {file_url[:20]}...")
+            except Exception as upload_error:
+                loggers["errors"].error(f"Failed to upload payment screenshot: {str(upload_error)}")
+                await update.message.reply_text(
+                    f"{EMOJI['error']} There was a problem uploading your payment screenshot. "
+                    "Please try again or contact support."
+                )
+                return PAYMENT
             
             # Store user telegram ID
             context.user_data["telegram_id"] = user.id
             
-            # Create order in system
+            # Validate cart and required details
+            if not context.user_data.get("cart"):
+                await update.message.reply_text(MESSAGES["empty_cart"])
+                return PAYMENT
+                
+            required_fields = ["name", "address", "contact", "cart"]
+            missing_fields = [field for field in required_fields if not context.user_data.get(field)]
+            
+            if missing_fields:
+                loggers["errors"].error(f"Missing required fields for order: {missing_fields}")
+                await update.message.reply_text(
+                    f"{EMOJI['error']} Missing information required for order: {', '.join(missing_fields)}.\n"
+                    "Please restart your order process with /start."
+                )
+                return ConversationHandler.END
+            
+            # Create order in system with enhanced logging
+            print(f"DEBUG: Creating order in system for user {user.id}")
             order_id, success = await order_manager.create_order(
                 context, context.user_data, file_url
             )
@@ -4269,6 +4661,22 @@ async def handle_payment_screenshot(
             if success and order_id:
                 # Clear the cart
                 manage_cart(context, "clear")
+                
+                # Clear conversation state markers to prevent incorrect timeout recovery
+                context.user_data.pop("category", None)
+                context.user_data.pop("strain_type", None) 
+                context.user_data.pop("current_location", None)
+                
+                # Set order completion markers
+                context.user_data["last_completed_order"] = order_id
+                context.user_data["order_completion_time"] = time.time()  # Record completion time
+                context.user_data["last_activity_time"] = time.time()  # Update activity time
+                
+                # Delete the processing message
+                try:
+                    await processing_msg.delete()
+                except Exception:
+                    pass  # Ignore if can't delete
                 
                 # Confirm to user
                 await update.message.reply_text(
@@ -4280,8 +4688,22 @@ async def handle_payment_screenshot(
                     f"Payment screenshot received for order {order_id} from user {user.id}"
                 )
                 
-                return ConversationHandler.END
+                return ConversationHandler.END             
             else:
+                # Log detailed error
+                loggers["errors"].error(
+                    f"Order creation failed for user {user.id}. "
+                    f"Cart items: {len(context.user_data.get('cart', []))} "
+                    f"Has file URL: {'Yes' if file_url else 'No'}"
+                )
+                
+                # Delete the processing message
+                try:
+                    await processing_msg.delete()
+                except Exception:
+                    pass  # Ignore if can't delete
+                
+                # Send error message
                 await update.message.reply_text(
                     f"{EMOJI['error']} There was a problem processing your order. "
                     "Please try again or contact customer support."
@@ -4289,13 +4711,16 @@ async def handle_payment_screenshot(
                 return PAYMENT
                 
         except Exception as e:
+            # Log detailed error
             loggers["errors"].error(f"Payment processing error: {str(e)}")
+            
+            # Send user-friendly error
             await update.message.reply_text(ERRORS["payment_processing"])
             return PAYMENT
     else:
         await update.message.reply_text(MESSAGES["invalid_payment"])
         return PAYMENT
-
+    
 def validate_image(file_bytes, max_size_mb=5):
     """
     Validate an uploaded image for security.
@@ -4307,30 +4732,42 @@ def validate_image(file_bytes, max_size_mb=5):
     Returns:
         tuple: (is_valid, error_message)
     """
+    if not file_bytes:
+        return False, "Empty file data received"
+        
     # Check file size
     size_mb = len(file_bytes) / (1024 * 1024)
     if size_mb > max_size_mb:
         return False, f"File too large: {size_mb:.1f}MB (max {max_size_mb}MB)"
     
-    # Check file signature (magic numbers)
-    # JPEG signature
-    if file_bytes[:3] == b'\xFF\xD8\xFF':
-        return True, "JPEG image"
+    # Check minimum size to ensure it's not an empty or corrupt image
+    if len(file_bytes) < 1000:  # Less than 1KB
+        return False, "File too small - might be corrupt or empty"
     
-    # PNG signature
-    if file_bytes[:8] == b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A':
-        return True, "PNG image"
+    try:
+        # Check file signature (magic numbers)
+        # JPEG signature
+        if file_bytes[:3] == b'\xFF\xD8\xFF':
+            return True, "JPEG image"
+        
+        # PNG signature
+        if file_bytes[:8] == b'\x89\x50\x4E\x47\x0D\x0A\x1A\x0A':
+            return True, "PNG image"
+        
+        # GIF signature
+        if file_bytes[:6] in (b'GIF87a', b'GIF89a'):
+            return True, "GIF image"
+        
+        # WebP signature
+        if len(file_bytes) > 12 and file_bytes[:4] == b'RIFF' and file_bytes[8:12] == b'WEBP':
+            return True, "WebP image"
+        
+        # No valid signature found
+        return False, "Invalid image format (only JPEG, PNG, GIF, and WebP images are allowed)"
+        
+    except Exception as e:
+        return False, f"Error validating image: {str(e)}"
     
-    # GIF signature
-    if file_bytes[:6] in (b'GIF87a', b'GIF89a'):
-        return True, "GIF image"
-    
-    # WebP signature
-    if file_bytes[:4] == b'RIFF' and file_bytes[8:12] == b'WEBP':
-        return True, "WebP image"
-    
-    return False, "Invalid file format (only JPEG, PNG, GIF, and WebP images are allowed)"
-
 async def track_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Track the status of an order.
@@ -6912,10 +7349,6 @@ async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Enhanced debug handler that traces all callback queries and provides state info.
     This helps identify issues with callbacks not being properly handled.
-    
-    Args:
-        update: Telegram update
-        context: Conversation context
     """
     query = update.callback_query
     if not query:
@@ -6923,6 +7356,21 @@ async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Track state
     await debug_state_tracking(update, context)
+    
+    # Check if this callback was already processed
+    callback_id = query.id
+    processed_callbacks = context.user_data.get("processed_callbacks", set())
+    if callback_id in processed_callbacks:
+        print(f"DEBUG CALLBACK: Skipping already processed callback: {callback_id}")
+        return
+    
+    # Check if this is a common callback that should be handled by specific handlers
+    common_callbacks = ["indica", "sativa", "hybrid", "back_to_categories", "back_to_strain"]
+    if query.data in common_callbacks:
+        # These are handled by specific handlers, don't attempt to handle again
+        print(f"DEBUG CALLBACK: Ignoring common callback: {query.data}")
+        await query.answer()  # Just answer the callback to prevent spinning
+        return
         
     print(f"DEBUG CALLBACK: Received unhandled callback with data: {query.data}")
     print(f"DEBUG CALLBACK: Current location: {context.user_data.get('current_location', 'Unknown')}")
@@ -6931,7 +7379,7 @@ async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Always answer the callback to prevent the loading spinner
     await query.answer()
-    
+
     # Try smart handling based on context
     current_location = context.user_data.get("current_location", "Unknown")
     category = context.user_data.get("category", "None")
@@ -7010,6 +7458,49 @@ async def post_init(application: Application):
             print(f"DEBUG: Error backing up persistence file: {e}")
     
     print("DEBUG: Post-init tasks complete, bot ready to start")
+
+def get_recovery_message(user_data):
+    """
+    Generate an appropriate recovery message based on user's conversation state.
+    
+    Args:
+        user_data (dict): The user's conversation data
+        
+    Returns:
+        str: Context-appropriate recovery message
+    """
+    current_location = user_data.get('current_location', '')
+    category = user_data.get('category', '')
+    
+    # Default message
+    message = (
+        f"{EMOJI['warning']} It looks like your conversation with me may have stalled.\n\n"
+        f"This could be due to a temporary issue. Please try again by using one of the options below."
+    )
+    
+    # Customize message based on context
+    if category == 'buds':
+        message = (
+            f"{EMOJI['warning']} It looks like your Premium Buds selection may have stalled.\n\n"
+            f"This could be due to a temporary issue. Please try again by using one of the options below."
+        )
+    elif category == 'carts':
+        message = (
+            f"{EMOJI['warning']} It looks like your Carts selection may have stalled.\n\n"
+            f"This could be due to a temporary issue. Please try again by using one of the options below."
+        )
+    elif current_location == 'details':
+        message = (
+            f"{EMOJI['warning']} It looks like you were in the middle of entering shipping details.\n\n"
+            f"Would you like to restart the process?"
+        )
+    elif current_location == 'payment':
+        message = (
+            f"{EMOJI['warning']} It looks like you were in the middle of submitting a payment.\n\n"
+            f"If you already completed your payment, you can track your order with the /track command."
+        )
+        
+    return message
 
 def main():
     """Set up the bot and start polling."""
@@ -7095,54 +7586,67 @@ def main():
         async def timeout_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             """
             Periodic job to detect and recover from stalled conversations.
-            Particularly focused on Premium Buds selection which may freeze.
+            Uses smart detection to avoid false positives while helping users
+            who might be stuck in a conversation flow.
             """
             now = time.time()
             bot = context.bot
-    
+            
             # Safely iterate through user data
             if hasattr(context.application, 'user_data'):
                 for user_id, user_data in context.application.user_data.items():
                     try:
-                        # Check if this user has been inactive but in the middle of a Premium Buds flow
+                        # Check if this user has been inactive for a significant period
                         last_activity = user_data.get('last_activity_time', 0)
+                        
+                        # Skip users with recent activity (less than 3 minutes)
+                        if now - last_activity < 180:  # 3 minutes
+                            continue
+                            
+                        # Skip users who have recently completed an order
+                        if user_data.get('last_completed_order') and now - user_data.get('order_completion_time', 0) < 600:  # 10 minutes
+                            continue
+                        
+                        # Skip users who recently received a recovery message
+                        if user_data.get('recovery_sent_recently'):
+                            continue
+                        
+                        # Detect if user is in the middle of a conversation
+                        current_location = user_data.get('current_location')
                         category = user_data.get('category')
-                        strain_type = user_data.get('strain_type')
-                
-                        # If user is in Premium Buds selection and inactive for more than 3 minutes
-                        if (category == "buds" and 
-                            now - last_activity > 180 and  # 3 minutes
-                            not user_data.get('recovery_sent_recently')):
-                    
-                            # Log the stalled conversation
-                            loggers["main"].warning(f"Detected stalled Premium Buds selection for user {user_id}")
-                            print(f"DEBUG: Sending recovery message for stalled Premium Buds selection to user {user_id}")
-                    
+                        
+                        # Only send recovery for users who appear to be in an active conversation flow
+                        if current_location or category:
+                            # Log the potentially stalled conversation 
+                            current_state = f"location:{current_location}, category:{category}"
+                            loggers["main"].warning(f"Detected potentially stalled conversation for user {user_id}: {current_state}")
+                            print(f"DEBUG: Sending recovery message for stalled conversation to user {user_id}")
+                            
                             # Mark as recently notified to prevent spam
                             user_data['recovery_sent_recently'] = True
                             user_data['recovery_sent_time'] = now
-                    
+                            
+                            # Create appropriate recovery message based on conversation state
+                            recovery_message = get_recovery_message(user_data)
+                            
                             # Send recovery message
                             await bot.send_message(
                                 chat_id=user_id,
-                                text=(
-                                    f"{EMOJI['warning']} It looks like your Premium Buds selection may have stalled.\n\n"
-                                    f"This could be due to a temporary issue. Please try again by using one of the options below:"
-                                ),
+                                text=recovery_message,
                                 reply_markup=InlineKeyboardMarkup([
                                     [InlineKeyboardButton(f"{EMOJI['restart']} Start Over", callback_data="restart_conversation")],
                                     [InlineKeyboardButton(f"{EMOJI['browse']} Browse Categories", callback_data="back_to_categories")]
                                 ])
                             )
-                    
+                        
                         # Clean up old recovery flags (after 10 minutes)
                         elif user_data.get('recovery_sent_recently') and now - user_data.get('recovery_sent_time', 0) > 600:
                             user_data['recovery_sent_recently'] = False
-                    
+                        
                     except Exception as e:
                         loggers["errors"].error(f"Error in timeout recovery for user {user_id}: {str(e)}")
                         continue  # Continue checking other users
-        
+
         # Add this line to your job_queue setup in main()
         job_queue.run_repeating(timeout_recovery_job, interval=60, first=90)  # Run every minute, start after 90 seconds
         
@@ -7195,19 +7699,16 @@ def main():
                     CallbackQueryHandler(choose_category_wrapper)
                 ],
                 STRAIN_TYPE: [
-                    # Match any callback in STRAIN_TYPE state
-                    CallbackQueryHandler(choose_strain_type_wrapper)
+                    # Only handle specific strain type patterns to avoid processing unrelated callbacks
+                    CallbackQueryHandler(choose_strain_type_wrapper, pattern="^(indica|sativa|hybrid|back_to_categories)$")
                 ],
                 BROWSE_BY: [
                     # Match all callbacks in BROWSE_BY state
                     CallbackQueryHandler(browse_carts_by_wrapper)
                 ],
                 PRODUCT_SELECTION: [
-                    # Handle all product selection callbacks with detailed debugging
-                    CallbackQueryHandler(lambda u, c: (
-                        print(f"DEBUG: Product selection callback: {u.callback_query.data}"),
-                        select_product_wrapper(u, c))[1]
-                    )
+                    # Directly call select_product_wrapper without any tuple wrapping
+                    CallbackQueryHandler(select_product_wrapper)
                 ],
                 QUANTITY: [
                     CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_"),
