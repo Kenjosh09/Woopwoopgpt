@@ -1452,7 +1452,249 @@ def get_user_session(context, user_id):
         
     # Update last activity time
     context.bot_data["sessions"][user_id]["last_activity"] = time.time()
+    
+    # Check user data size and trim if necessary
+    if hasattr(context, "user_data") and user_id in context.user_data:
+        trim_large_data_structures(context.user_data[user_id], loggers)
+    
     return context.bot_data["sessions"][user_id]
+
+def cleanup_old_sessions(context):
+    """
+    Clean up old or inactive user sessions to prevent memory leaks.
+    
+    Args:
+        context: The conversation context
+        
+    Returns:
+        int: Number of sessions cleaned up
+    """
+    if "sessions" not in context.bot_data:
+        return 0
+    
+    now = time.time()
+    cleanup_count = 0
+    sessions_to_remove = []
+    
+    # Find old sessions
+    for user_id, session in context.bot_data["sessions"].items():
+        # Check if session is older than 7 days
+        if now - session.get("last_activity", now) > 604800:  # 7 days in seconds
+            sessions_to_remove.append(user_id)
+    
+    # Remove old sessions
+    for user_id in sessions_to_remove:
+        del context.bot_data["sessions"][user_id]
+        cleanup_count += 1
+    
+    return cleanup_count
+
+async def cleanup_abandoned_carts(context, order_manager, loggers):
+    """
+    Find and clean up abandoned carts (incomplete orders).
+    
+    Args:
+        context: The conversation context
+        order_manager: OrderManager instance
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        int: Number of carts cleaned up
+    """
+    if not hasattr(context, "user_data"):
+        return 0
+    
+    now = time.time()
+    cleanup_count = 0
+    user_ids_with_abandoned_carts = []
+    
+    # Find users with abandoned carts (active over 3 hours)
+    for user_id, user_data in context.user_data.items():
+        # Skip users that don't have cart data
+        if "cart" not in user_data:
+            continue
+        
+        # Skip empty carts
+        if not user_data["cart"]:
+            continue
+        
+        # Get the last activity time
+        last_activity = user_data.get("last_activity_time", now)
+        
+        # If inactive for more than 3 hours, consider it abandoned
+        if now - last_activity > 10800:  # 3 hours in seconds
+            user_ids_with_abandoned_carts.append(user_id)
+    
+    # Process abandoned carts
+    for user_id in user_ids_with_abandoned_carts:
+        try:
+            # Get cart content for logging
+            cart = context.user_data[user_id].get("cart", [])
+            cart_size = len(cart)
+            
+            # Clear the cart
+            context.user_data[user_id]["cart"] = []
+            
+            # Log the cleanup
+            loggers["main"].info(f"Cleaned up abandoned cart for user {user_id}: {cart_size} items")
+            
+            cleanup_count += 1
+        except Exception as e:
+            loggers["errors"].error(f"Error cleaning up cart for user {user_id}: {e}")
+    
+    return cleanup_count
+
+def get_persistence_file_size():
+    """
+    Get the size of the persistence file in megabytes.
+    
+    Returns:
+        float: Size of the persistence file in MB, or 0 if file doesn't exist
+    """
+    try:
+        # Check if the file exists
+        if not os.path.exists("bot_persistence"):
+            return 0
+            
+        # Get file size in bytes and convert to MB
+        size_in_bytes = os.path.getsize("bot_persistence")
+        size_in_mb = size_in_bytes / (1024 * 1024)
+        
+        return size_in_mb
+    except Exception:
+        # If there's an error, return 0
+        return 0
+
+def check_context_data_size(user_data, key, max_size_kb=512):
+    """
+    Check if a data structure in user_data is getting too large and should be trimmed.
+    
+    Args:
+        user_data (dict): User data dictionary
+        key (str): Key of the data structure to check
+        max_size_kb (int): Maximum size in kilobytes
+        
+    Returns:
+        bool: True if data is too large, False otherwise
+    """
+    if key not in user_data:
+        return False
+    
+    try:
+        # Estimate size by pickling
+        data_size = len(pickle.dumps(user_data[key])) / 1024  # size in KB
+        
+        return data_size > max_size_kb
+    except Exception:
+        # If there's an error in size calculation, assume it's not too large
+        return False
+
+def trim_large_data_structures(user_data, loggers):
+    """
+    Monitor and trim large data structures in user_data to prevent memory issues.
+    
+    Args:
+        user_data (dict): User data dictionary
+        loggers (dict): Dictionary of logger instances
+        
+    Returns:
+        int: Number of items trimmed
+    """
+    trim_count = 0
+    
+    # Check and trim oversized message history
+    if check_context_data_size(user_data, "message_history", max_size_kb=256):
+        # If present and too large, keep only the 20 most recent messages
+        if isinstance(user_data["message_history"], list):
+            user_data["message_history"] = user_data["message_history"][-20:]
+            trim_count += 1
+            loggers["main"].info("Trimmed large message history to last 20 messages")
+    
+    # Check and clean up any large cached data
+    for key in list(user_data.keys()):
+        if key.startswith("cached_") and check_context_data_size(user_data, key, max_size_kb=128):
+            # Remove oversized cache entries
+            del user_data[key]
+            trim_count += 1
+            loggers["main"].info(f"Removed oversized cached data: {key}")
+    
+    return trim_count
+
+def cleanup_persistence_file(context, loggers):
+    """
+    Create a backup of the persistence file and rebuild it with only essential data.
+    This helps prevent the pickle file from growing too large over time.
+    
+    Args:
+        context: The conversation context
+        loggers: Dictionary of logger instances
+        
+    Returns:
+        tuple: (success, old_size, new_size)
+    """
+    try:
+        # Check current file size
+        current_size = get_persistence_file_size()
+        
+        # If file is smaller than 10MB, no need to clean up
+        if current_size < 10:
+            return True, current_size, current_size
+        
+        # Create a backup with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"bot_persistence_backup_{timestamp}"
+        
+        # Copy the file
+        if os.path.exists("bot_persistence"):
+            shutil.copy2("bot_persistence", backup_filename)
+            loggers["main"].info(f"Created persistence backup: {backup_filename}")
+        
+        # Clean up the context data before saving
+        # Note: We don't modify context directly, as that would change the running state
+        
+        # We need to manually write a new persistence file with cleaned data
+        # This approach keeps the running context intact but creates a cleaner file
+        
+        # First, create a clean copy of essential data
+        essential_data = {
+            "user_data": {},
+            "chat_data": {},
+            "bot_data": {
+                "start_time": context.bot_data.get("start_time", time.time()),
+                "sessions": context.bot_data.get("sessions", {})
+            },
+            "callback_data": context.bot_data.get("callback_data", {})
+        }
+        
+        # Copy only active user data (last 30 days)
+        now = time.time()
+        for user_id, user_data in context.user_data.items():
+            last_activity = user_data.get("last_activity_time", 0)
+            
+            # If active in the last 30 days, keep their data
+            if now - last_activity < 2592000:  # 30 days in seconds
+                essential_data["user_data"][user_id] = user_data
+        
+        # Use pickle to save the essential data
+        with open("bot_persistence_clean", "wb") as f:
+            pickle.dump(essential_data, f)
+        
+        # Get the new file size
+        new_size = os.path.getsize("bot_persistence_clean") / (1024 * 1024)
+        
+        # Rename the clean file to replace the original
+        if os.path.exists("bot_persistence_clean"):
+            os.replace("bot_persistence_clean", "bot_persistence")
+        
+        loggers["main"].info(
+            f"Cleaned persistence file. Old size: {current_size:.2f}MB, New size: {new_size:.2f}MB"
+        )
+        
+        return True, current_size, new_size
+        
+    except Exception as e:
+        loggers["errors"].error(f"Error cleaning up persistence file: {e}")
+        return False, current_size, current_size
 
 def generate_order_id():
     """
@@ -5902,6 +6144,40 @@ def main():
             conversation_timeout=300  # 5 minutes timeout
         )
         
+        # Add scheduled cleanup jobs
+        async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+            """Periodic job to clean up resources and prevent memory leaks"""
+            try:
+                # Clean up old sessions
+                session_cleanup_count = cleanup_old_sessions(context)
+                if session_cleanup_count > 0:
+                    loggers["main"].info(f"Cleaned up {session_cleanup_count} old sessions")
+                
+                # Clean up abandoned carts
+                cart_cleanup_count = await cleanup_abandoned_carts(context, order_manager, loggers)
+                if cart_cleanup_count > 0:
+                    loggers["main"].info(f"Cleaned up {cart_cleanup_count} abandoned carts")
+                
+                # Check persistence file size and clean up if needed
+                persistence_size = get_persistence_file_size()
+                if persistence_size > 10:  # If larger than 10MB
+                    loggers["main"].info(f"Persistence file size: {persistence_size:.2f}MB, attempting cleanup")
+                    success, old_size, new_size = cleanup_persistence_file(context, loggers)
+                    if success:
+                        reduction = old_size - new_size
+                        reduction_pct = (reduction / old_size) * 100 if old_size > 0 else 0
+                        loggers["main"].info(
+                            f"Persistence cleanup successful. Reduced by {reduction:.2f}MB ({reduction_pct:.1f}%)"
+                        )
+                
+            except Exception as e:
+                loggers["errors"].error(f"Error in cleanup job: {e}")
+
+        # Schedule cleanup every 12 hours
+        job_queue.run_repeating(cleanup_job, interval=43200, first=3600)  # 12 hours, first run after 1 hour
+
+
+
         # Set up conversation handler for main ordering flow
         conversation_handler = ConversationHandler(
             entry_points=[CommandHandler("start", start_wrapper)],
