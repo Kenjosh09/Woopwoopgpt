@@ -564,6 +564,158 @@ def log_security_event(logger, event_type, user_id=None, ip=None, details=None):
         f"SECURITY EVENT [{event_type}] | {timestamp} | {user_info} | {ip_info} | {details_info}"
     )
 
+async def send_typing_action(context, chat_id, seconds=1):
+    """
+    Send a typing indicator to the user to show the bot is processing.
+    
+    Args:
+        context: Conversation context containing the bot
+        chat_id (int): Chat ID to send typing indicator to
+        seconds (float): How long to show typing for
+    """
+    try:
+        # Send typing action
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        
+        # If more than minimal typing time is requested, sleep
+        if seconds > 0.5:
+            await asyncio.sleep(seconds)
+    except Exception:
+        # Silently ignore errors with typing indicator
+        pass
+
+class BotResponse:
+    """
+    Class to create consistent, well-formatted bot responses.
+    
+    This helps maintain a consistent style and structure across all bot messages.
+    """
+    
+    def __init__(self, emoji_key=None, header=None):
+        """
+        Initialize a bot response.
+        
+        Args:
+            emoji_key (str, optional): Key to lookup in EMOJI dictionary
+            header (str, optional): Header text for the message
+        """
+        self.parts = []
+        if emoji_key and emoji_key in EMOJI:
+            self.header = f"{EMOJI[emoji_key]} {header}" if header else EMOJI[emoji_key]
+        else:
+            self.header = header
+    
+    def add_header(self, text, emoji_key=None):
+        """
+        Add a header to the message.
+        
+        Args:
+            text (str): Header text
+            emoji_key (str, optional): Key to lookup in EMOJI dictionary
+            
+        Returns:
+            BotResponse: self for method chaining
+        """
+        if emoji_key and emoji_key in EMOJI:
+            self.header = f"{EMOJI[emoji_key]} {text}"
+        else:
+            self.header = text
+        return self
+    
+    def add_paragraph(self, text):
+        """
+        Add a paragraph to the message.
+        
+        Args:
+            text (str): Paragraph text
+            
+        Returns:
+            BotResponse: self for method chaining
+        """
+        self.parts.append(text)
+        return self
+    
+    def add_bullet_list(self, items, emoji_key=None):
+        """
+        Add a bullet list to the message.
+        
+        Args:
+            items (list): List items
+            emoji_key (str, optional): Key to lookup in EMOJI dictionary for bullets
+            
+        Returns:
+            BotResponse: self for method chaining
+        """
+        bullet = EMOJI[emoji_key] if emoji_key and emoji_key in EMOJI else "•"
+        bullet_list = []
+        
+        for item in items:
+            bullet_list.append(f"{bullet} {item}")
+        
+        self.parts.append("\n".join(bullet_list))
+        return self
+    
+    def add_data_table(self, data, headers=None):
+        """
+        Add a formatted data table.
+        
+        Args:
+            data (list): List of data rows
+            headers (list, optional): Column headers
+            
+        Returns:
+            BotResponse: self for method chaining
+        """
+        if not data:
+            return self
+        
+        table_str = ""
+        
+        # Add headers if provided
+        if headers:
+            table_str += " | ".join(headers) + "\n"
+            table_str += "-" * (sum(len(h) for h in headers) + 3 * (len(headers) - 1)) + "\n"
+        
+        # Add data rows
+        for row in data:
+            table_str += " | ".join(str(cell) for cell in row)
+            table_str += "\n"
+        
+        self.parts.append(table_str)
+        return self
+    
+    def add_divider(self):
+        """
+        Add a divider line.
+        
+        Returns:
+            BotResponse: self for method chaining
+        """
+        self.parts.append("------------------------")
+        return self
+    
+    def get_message(self):
+        """
+        Get the complete formatted message.
+        
+        Returns:
+            str: The formatted message text
+        """
+        message = ""
+        
+        # Add header if present
+        if self.header:
+            message += f"{self.header}\n\n"
+        
+        # Add all parts with spacing
+        for i, part in enumerate(self.parts):
+            message += part
+            # Add spacing after all parts except the last
+            if i < len(self.parts) - 1:
+                message += "\n\n"
+        
+        return message
+
 def log_admin_action(logger, admin_id, action, order_id=None):
     """
     Log admin actions with consistent formatting.
@@ -2202,6 +2354,17 @@ class OrderManager:
         Returns:
             tuple: (order_id, success_status)
         """
+        # Send a message indicating the order is being processed
+        status_message = None
+        try:
+            status_message = await context.bot.send_message(
+                chat_id=user_data.get("telegram_id"),
+                text=f"{EMOJI['info']} Processing your order... Please wait a moment."
+            )
+        except Exception:
+            # Continue even if we can't send this message
+            pass
+            
         # Generate order ID
         order_id = generate_order_id()
         
@@ -2220,6 +2383,14 @@ class OrderManager:
         
         if not cart:
             self.loggers["errors"].error(f"Attempted to create order with empty cart for user {telegram_id}")
+            
+            # Update status message if it was sent
+            if status_message:
+                try:
+                    await status_message.edit_text(f"{EMOJI['error']} Error: Your cart is empty. Please add items before ordering.")
+                except Exception:
+                    pass
+                    
             return None, False
         
         # Format cart items in a single cell with bullet points
@@ -2250,6 +2421,13 @@ class OrderManager:
             cart_summary.strip()         # Notes (cart summary)
         ]
         
+        # Update status message with progress
+        if status_message:
+            try:
+                await status_message.edit_text(f"{EMOJI['info']} Saving your order... Almost done!")
+            except Exception:
+                pass
+        
         # Add to Google Sheet
         success = await self.google_apis.add_order_to_sheet(order_data)
         
@@ -2266,9 +2444,24 @@ class OrderManager:
                 f"Items: {len(cart)} | Total: ₱{total_price:,.2f}"
             )
             
+            # Delete the status message now that we're done
+            if status_message:
+                try:
+                    await status_message.delete()
+                except Exception:
+                    pass
+                    
             return order_id, True
         else:
             self.loggers["errors"].error(f"Failed to create order for user {telegram_id}")
+            
+            # Update status message with error
+            if status_message:
+                try:
+                    await status_message.edit_text(f"{EMOJI['error']} Failed to process your order. Please try again later.")
+                except Exception:
+                    pass
+                    
             return None, False
     
     async def update_order_status(self, context, order_id, new_status, tracking_link=None):
@@ -2379,6 +2572,7 @@ class OrderManager:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Start the ordering conversation with available categories.
+    Enhanced with better UX and user guidance.
     
     Args:
         update: Telegram update
@@ -2390,6 +2584,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_ma
         int: Next conversation state
     """
     user = update.message.from_user
+    first_name = user.first_name if user.first_name else "there"
     
     # Initialize user cart if needed
     if "cart" not in context.user_data:
@@ -2406,6 +2601,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_ma
     # Log the conversation start
     loggers["main"].info(f"User {user.id} ({user.full_name}) started order conversation")
     
+    # Create welcome response with BotResponse
+    welcome = BotResponse("welcome") \
+        .add_header(f"Hi {first_name}! Welcome to Ganja Paraiso!", "welcome") \
+        .add_paragraph("We're excited to help you find the perfect products to enhance your experience.") \
+        .add_paragraph("Please select a category below to start browsing:")
+
+    # Send the welcome message with typing indicator
+    await send_typing_action(context, update.effective_chat.id, 1)
+    
     # Check which categories have available products
     available_categories = []
     for category_id in PRODUCTS:
@@ -2414,15 +2618,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_ma
             available_categories.append(category_id)
     
     if not available_categories:
-        await update.message.reply_text(
-            f"{EMOJI['warning']} Sorry, we don't have any products in stock at the moment. "
-            "Please check back later."
-        )
+        no_products = BotResponse("warning") \
+            .add_header("No Products Available", "warning") \
+            .add_paragraph("Sorry, we don't have any products in stock at the moment.") \
+            .add_paragraph("Please check back later or contact support for assistance.")
+            
+        await update.message.reply_text(no_products.get_message())
         return ConversationHandler.END
     
     # Send welcome message with available category buttons
     await update.message.reply_text(
-        MESSAGES["welcome"],
+        welcome.get_message(),
         reply_markup=build_category_buttons(available_categories)
     )
     
@@ -3532,39 +3738,47 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
         # Get cart and user details
         cart = context.user_data.get("cart", [])
         total_cost = sum(item.get("total_price", 0) for item in cart)
-        shipping_details = context.user_data.get("shipping_details", "N/A")
+        name = context.user_data.get("name", "Unknown")
+        address = context.user_data.get("address", "Unknown")
+        contact = context.user_data.get("contact", "Unknown")
         customer_name = update.callback_query.from_user.full_name
         
-        # Create a detailed cart summary
-        cart_summary = ""
-        for idx, item in enumerate(cart, 1):
+        # First show an order summary with a nice format
+        order_summary = BotResponse("cart") \
+            .add_header("Order Summary", "cart") \
+            .add_paragraph(f"Thank you, {update.effective_user.first_name}! Here's a summary of your order:")
+        
+        # Add item details
+        items_list = []
+        for item in cart:
+            category = item.get("category", "Unknown")
+            product = item.get("suboption", "Unknown")
+            quantity = item.get("quantity", 0)
             unit = item.get("unit", "units")
-            cart_summary += (
-                f"{idx}. {item['category']} ({item['suboption']}): "
-                f"{item['quantity']} {unit} - ₱{item['total_price']:,.2f}\n"
-            )
+            price = item.get("total_price", 0)
+            
+            items_list.append(f"{quantity}x {category} ({product}) - ₱{price:,.2f}")
         
-        # Prepare the complete summary for the admin
-        summary = (
-            f"{EMOJI['new']} New Order Received\n\n"
-            f"{EMOJI['customer']} Customer: {customer_name}\n\n"
-            f"{EMOJI['cart']} Cart Items:\n{cart_summary}\n\n"
-            f"{EMOJI['money']} Total Cost: ₱{total_cost:,.2f}\n\n"
-            f"{EMOJI['shipping']} Shipping Details: {shipping_details}"
-        )
+        order_summary.add_bullet_list(items_list)
+        order_summary.add_divider()
+        order_summary.add_paragraph(f"Total: ₱{total_cost:,.2f}")
+        order_summary.add_paragraph(f"Shipping to: {mask_sensitive_data(name, 'name')}")
+        order_summary.add_paragraph(f"Address: {mask_sensitive_data(address, 'address')}")
+        order_summary.add_paragraph(f"Contact: {mask_sensitive_data(contact, 'phone')}")
         
-        # Log the order confirmation
-        loggers["orders"].info(
-            f"User {query.from_user.id} confirmed order with {len(cart)} items "
-            f"totaling ₱{total_cost:,.2f}"
-        )
-        
-        # Send summary to admin
-        await context.bot.send_message(admin_id, summary)
-        
-        # First send payment text with HTML parsing explicitly enabled
+        # Send the order summary message
         await query.edit_message_text(
-            MESSAGES["payment_instructions"].format(GCASH_NUMBER),
+            order_summary.get_message(),
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Show typing indicator before payment instructions
+        await send_typing_action(context, query.message.chat_id, 1)
+        
+        # Then send payment instructions with HTML parsing explicitly enabled
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=MESSAGES["payment_instructions"].format(GCASH_NUMBER),
             parse_mode=ParseMode.HTML  # Explicitly set HTML parse mode
         )
         
@@ -6040,6 +6254,96 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def contextual_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Provide context-sensitive help based on where the user is in the conversation.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    # Determine which state the user is in
+    current_state = context.user_data.get("current_location", "")
+    category = context.user_data.get("category", "")
+    
+    # Create base help response
+    help_response = BotResponse("help").add_header("Need Help?", "help")
+    
+    # Add contextual guidance based on state
+    if current_state == "categories" or not current_state:
+        help_response.add_paragraph(
+            "You're currently at the product categories menu. "
+            "Select a category to browse our products."
+        ).add_bullet_list([
+            "Tap on any category to see products",
+            "Use /track to check an existing order",
+            "Use /help to see available commands"
+        ])
+    
+    elif current_state == "strain_selection":
+        help_response.add_paragraph(
+            "You're selecting a strain type for your product. "
+            "Different strains provide different effects:"
+        ).add_bullet_list([
+            "Indica: More relaxing, good for evening use",
+            "Sativa: More energizing, good for daytime use",
+            "Hybrid: Balanced effects, good for any time"
+        ])
+    
+    elif "product_" in current_state:
+        help_response.add_paragraph(
+            "You're selecting the quantity for your product. "
+            "Enter a number for the quantity you'd like to purchase."
+        ).add_paragraph(
+            "For premium buds, the minimum order is 1 gram. "
+            "For local products, you can choose from 10g, 50g, 100g, or 300g options."
+        )
+    
+    elif current_state == "details":
+        help_response.add_paragraph(
+            "You need to provide your shipping details in this format:"
+        ).add_paragraph(
+            "Name / Address / Contact Number"
+        ).add_paragraph(
+            "For example: Juan Dela Cruz / 123 Main St, City / 09171234567"
+        )
+    
+    elif current_state == "payment":
+        help_response.add_paragraph(
+            "Please send a screenshot of your payment to complete the order. "
+            "Make sure the payment amount and reference number are clearly visible."
+        ).add_bullet_list([
+            f"Send payment to GCash: {GCASH_NUMBER}",
+            "Use the QR code provided for faster payment",
+            "The screenshot must be a photo, not a file"
+        ])
+    
+    else:
+        # General help
+        help_response.add_paragraph(
+            "Here are some general tips to help you navigate our bot:"
+        ).add_bullet_list([
+            "Use /start to begin shopping",
+            "Use /track to check an existing order",
+            "Use /reset to restart the conversation if you get stuck",
+            "Use /support to contact customer support"
+        ])
+    
+    # Always add general commands at the end
+    help_response.add_divider().add_paragraph(
+        "Available commands:"
+    ).add_bullet_list([
+        "/start - Start shopping",
+        "/track - Track your order",
+        "/help - Show this help message",
+        "/reset - Reset the conversation",
+        "/support - Contact customer support"
+    ])
+    
+    # Send the help message
+    await update.message.reply_text(help_response.get_message())
+
 async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin command to check system health.
@@ -6126,6 +6430,9 @@ async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         loggers["main"].info(f"User {user_id} issued /start command")
         
+        # Send a typing indicator for better UX
+        await send_typing_action(context, update.effective_chat.id, 1)
+        
         # Clear any existing conversation state
         return await start(update, context, inventory_manager, loggers)
     except Exception as e:
@@ -6135,10 +6442,13 @@ async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Send user-friendly error message
         try:
-            await update.message.reply_text(
-                f"{EMOJI['error']} Sorry, there was an error processing your command.\n\n"
-                f"Please try again in a moment or contact support if the issue persists."
-            )
+            # Create a friendly error response
+            response = BotResponse("error") \
+                .add_header("Something went wrong", "error") \
+                .add_paragraph("Sorry, there was an error processing your command.") \
+                .add_paragraph("Please try again in a moment or contact support if the issue persists.")
+            
+            await update.message.reply_text(response.get_message())
         except Exception:
             pass  # If we can't even send a message, don't crash
         
@@ -6229,15 +6539,15 @@ def main():
         
         # Create admin panel with multiple admin IDs
         admin_panel = AdminPanel(app.bot, admin_ids, google_apis, order_manager, loggers)
-        
         # Set up error handlers
         app.add_error_handler(enhanced_error_handler)
         app.add_error_handler(error_handler)
-        
         # Add recovery command handlers
         app.add_handler(CommandHandler("reset", reset_command))
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("support", support_command))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("?", contextual_help))  # Short command for contextual help
         app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
         app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
         # Updated with more specific pattern
@@ -6250,7 +6560,6 @@ def main():
         app.add_handler(CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"))
         app.add_handler(CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"))
         app.add_handler(CallbackQueryHandler(handle_start_shopping, pattern="^start_shopping$"))
-
         # Schedule periodic checks for stuck conversations
         job_queue = app.job_queue
         job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
