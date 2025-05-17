@@ -88,7 +88,7 @@ if not TOKEN:
     
 ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "5167750837"))
 GCASH_NUMBER = os.getenv("GCASH_NUMBER", "09171234567")
-GCASH_QR_CODE_URL = os.getenv("GCASH_QR_CODE_URL", "https://drive.google.com/file/d/1kePOFyVimpLVnnp_-HEb3cihvIHJ2P4X/view?usp=drive_link")
+GCASH_QR_CODE_URL = os.getenv("GCASH_QR_CODE_URL", "https://example.com/gcash_qr.jpg")
 
 # Google API configuration
 GOOGLE_SHEET_NAME = "Telegram Orders"
@@ -1913,12 +1913,14 @@ def get_common_buttons(button_type, context_data=None):
         list: List of InlineKeyboardButton objects or rows
     """
     if button_type == "confirm_cancel":
+        # Confirm and cancel buttons
         return [
             [create_button("action", "confirm", "Confirm")],
             [create_button("cancel", "cancel", "Cancel")]
         ]
     
     elif button_type == "order_actions":
+        # Order action buttons
         return [
             [create_button("action", "add_more", "Add More", f"{EMOJI['cart']} Add More")],
             [create_button("action", "proceed", "Proceed to Checkout", f"{EMOJI['shipping']} Proceed to Checkout")],
@@ -1926,13 +1928,45 @@ def get_common_buttons(button_type, context_data=None):
         ]
     
     elif button_type == "restart_home":
+        # Restart and home buttons
         return [
             [create_button("action", "restart_conversation", "Reset Session", f"{EMOJI['restart']} Reset Session")],
             [create_button("action", "start", "Main Menu", f"{EMOJI['home']} Main Menu")]
         ]
     
+    elif button_type == "strain_buttons":
+        # Strain selection buttons
+        return [
+            [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
+            [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
+            [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
+            [create_button("back", "back_to_categories", "Back to Categories")]
+        ]
+    
     # Default empty button list
     return []
+
+def convert_gdrive_url_to_direct_link(url):
+    """
+    Convert a Google Drive sharing URL to a direct download link suitable for images.
+    
+    Args:
+        url (str): Google Drive URL (e.g., https://drive.google.com/file/d/FILE_ID/view?usp=sharing)
+        
+    Returns:
+        str: Direct download URL or the original URL if conversion fails
+    """
+    try:
+        # Check if it's a Google Drive URL
+        if "drive.google.com" in url and "/file/d/" in url:
+            # Extract the file ID
+            file_id = url.split("/file/d/")[1].split("/")[0]
+            # Create direct download link
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+        return url
+    except Exception:
+        # Return original URL if any error occurs
+        return url
 
 def validate_quantity(text, category=None):
     """
@@ -3244,7 +3278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await send_typing_action(context, update.effective_chat.id, 1)
     
     # Fixed category list approach - ensure we have categories
-    available_categories = ['buds', 'local', 'carts']  # Include all main categories
+    available_categories = ['buds', 'local', 'carts', 'edibles']  # Include all main categories
     
     # Verify which categories have available products (for logging only)
     for category_id in PRODUCTS:
@@ -3292,11 +3326,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE,
         try:
             await update.message.reply_text(
                 "Welcome! Please select a category:",
-                reply_markup=InlineKeyboardMarkup([
+                reply_markup=create_button_layout([
                     [InlineKeyboardButton("Premium Buds", callback_data="buds")],
                     [InlineKeyboardButton("Local (BG)", callback_data="local")],
                     [InlineKeyboardButton("Carts", callback_data="carts")],
-                    [InlineKeyboardButton("Cancel", callback_data="cancel")]
+                    [create_button("cancel", "cancel", "Cancel")]
                 ])
             )
             return CATEGORY
@@ -3499,12 +3533,7 @@ async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_T
                 del context.user_data["strain_type"]
             
             # Build the strain selection keyboard
-            keyboard = [
-                [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
-                [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
-                [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
-                [create_button("back", "back_to_categories", "Back to Categories")]
-            ]
+            keyboard = keyboard = get_common_buttons("strain_buttons")
             
             await query.edit_message_text(
                 f"{EMOJI['buds']} Select Strain Type:",
@@ -3524,8 +3553,8 @@ async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_T
         try:
             await query.edit_message_text(
                 f"{EMOJI['error']} Sorry, something went wrong during navigation. Let's start again.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['restart']} Start Over", callback_data="restart_conversation")]
+                reply_markup=create_button_layout([
+                    [create_button("action", "restart_conversation", "Start Over", f"{EMOJI['restart']} Start Over")]
                 ])
             )
         except Exception:
@@ -3958,12 +3987,7 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
             return await back_to_categories(update, context, inventory_manager, loggers)
             
         # Build the strain selection keyboard
-        keyboard = [
-            [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
-            [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
-            [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
-            [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-        ]
+        keyboard = keyboard = get_common_buttons("strain_buttons")
         
         try:
             await query.edit_message_text(
@@ -3999,9 +4023,9 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     if not selected_product:
         await query.edit_message_text(
             "Sorry, this product is no longer available.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            reply_markup=create_button_layout([
+                [create_button("back", "back_to_browse", "Back to Browse")],
+                [create_button("back", "back_to_categories", "Back to Categories")]
             ])
         )
         return PRODUCT_SELECTION
@@ -4027,9 +4051,9 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
             f"Price: ₱{selected_product.get('price', 0):,.0f}\n"
             f"Stock: {selected_product.get('stock', 0)} {product_unit}\n\n"
             f"Please enter the quantity (minimum {min_order} {product_unit}):",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            reply_markup=create_button_layout([
+                [create_button("back", "back_to_browse", "Back to Browse")],
+                [create_button("back", "back_to_categories", "Back to Categories")]
             ])
         )
     except TelegramError as e:
@@ -4515,19 +4539,33 @@ async def confirm_details(update: Update, context: ContextTypes.DEFAULT_TYPE, lo
         try:
             # Only send if a QR code URL is configured
             if GCASH_QR_CODE_URL and GCASH_QR_CODE_URL != "https://example.com/gcash_qr.jpg":
+                # Convert Google Drive URL to direct link format
+                direct_url = convert_gdrive_url_to_direct_link(GCASH_QR_CODE_URL)
+                
+                # Log the URL being used
+                print(f"DEBUG: Sending QR code with URL: {direct_url}")
+                loggers["main"].info(f"Sending QR code with URL: {direct_url}")
+                
+                # Send the QR code
                 await context.bot.send_photo(
                     chat_id=query.from_user.id,
-                    photo=GCASH_QR_CODE_URL,
+                    photo=direct_url,
                     caption=f"{EMOJI['qrcode']} GCash QR Code for {GCASH_NUMBER}\nScan this code to pay directly."
                 )
         except Exception as e:
             # Log the error but continue with the flow
-            loggers["errors"].error(f"Failed to send QR code: {e}")
-        
-        return PAYMENT
-    elif query.data == 'edit_details':
-        await query.edit_message_text(MESSAGES["checkout_prompt"])
-        return DETAILS
+            error_msg = f"Failed to send QR code: {type(e).__name__}: {str(e)}"
+            print(f"DEBUG ERROR: {error_msg}")
+            loggers["errors"].error(error_msg)
+            
+            # Inform the user they can still pay without QR code
+            try:
+                await context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=f"{EMOJI['info']} Please send payment to GCash number: {GCASH_NUMBER}"
+                )
+            except Exception:
+                pass  # Ignore errors in the fallback message
     
 # ---------------------------- Payment & Tracking Handlers ----------------------------
 async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4556,10 +4594,10 @@ async def track_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Add recent orders button if the user has previous orders
     if user_orders and len(user_orders) > 0:
-        keyboard.append([InlineKeyboardButton("📋 Show My Recent Orders", callback_data="show_recent_orders")])
-    
+        keyboard.append([create_button("action", "show_recent_orders", "Show My Recent Orders", f"{EMOJI['list']} Show My Recent Orders")])
+
     # Always add cancel button
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")])
+    keyboard.append([create_button("cancel", "cancel_tracking", "Cancel")])
     
     await update.message.reply_text(
         prompt_message,
@@ -4609,10 +4647,10 @@ async def show_recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )])
     
     # Add a button to enter order ID manually
-    keyboard.append([InlineKeyboardButton("🔢 Enter Different Order ID", callback_data="enter_order_id")])
-    
+    keyboard.append([create_button("action", "enter_order_id", "Enter Different Order ID", f"{EMOJI['back']} Enter Different Order ID")])
+
     # Add cancel button
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_tracking")])
+    keyboard.append([create_button("cancel", "cancel_tracking", "Cancel")])
     
     await query.edit_message_text(
         message,
@@ -5927,8 +5965,8 @@ class AdminPanel:
         await query.edit_message_text(
             f"{EMOJI['search']} Please enter the Order ID you want to search for:\n\n"
             f"Example: WW-1234-ABC",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['back']} Back to Admin Panel", callback_data="back_to_admin")]
+            reply_markup=create_button_layout([
+                [create_button("back", "back_to_admin", "Back to Admin Panel")]
             ])
         )
         
@@ -6741,8 +6779,8 @@ async def contact_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create the keyboard with a button to open chat with support admin
     keyboard = [
-        [InlineKeyboardButton("📱 Chat with Support", url=support_chat_url)],
-        [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data=f"refresh_tracking_{order_id}")]
+        [create_button("link", None, "Chat with Support", url=support_chat_url)],
+        [create_button("action", "start", "Main Menu", f"{EMOJI['home']} Main Menu")]
     ]
     
     # Log this support request
@@ -6789,8 +6827,8 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     keyboard = [
-        [InlineKeyboardButton("📱 Chat with Support", url=support_chat_url)],
-        [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+        [create_button("link", None, "Chat with Support", url=support_chat_url)],
+        [create_button("action", "start", "Main Menu", f"{EMOJI['home']} Main Menu")]
     ]
     
     logging.info(f"User {user_id} accessed support command")
@@ -6833,18 +6871,18 @@ async def get_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             help_message,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Bot", callback_data="restart_conversation")],
-                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+            reply_markup=create_button_layout([
+                [create_button("action", "restart_conversation", "Restart Bot", f"{EMOJI['restart']} Restart Bot")],
+                [create_button("action", "start", "Main Menu", f"{EMOJI['home']} Main Menu")]
             ])
         )
     else:
         await update.message.reply_text(
             help_message,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{EMOJI['restart']} Restart Bot", callback_data="restart_conversation")],
-                [InlineKeyboardButton(f"{EMOJI['home']} Main Menu", callback_data="start")]
+            reply_markup=create_button_layout([
+                [create_button("action", "restart_conversation", "Restart Bot", f"{EMOJI['restart']} Restart Bot")],
+                [create_button("action", "start", "Main Menu", f"{EMOJI['home']} Main Menu")]
             ])
         )
 
