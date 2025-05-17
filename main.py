@@ -3445,7 +3445,7 @@ async def show_local_products(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
-    Handle product selection.
+    Handle product selection after strain type or browse options.
     
     Args:
         update: Telegram update
@@ -3456,10 +3456,14 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     Returns:
         int: Next conversation state
     """
+    # Track state for debugging
+    await debug_state_tracking(update, context)
+    
     query = update.callback_query
     await query.answer()
     
     selection = query.data
+    print(f"DEBUG PRODUCT: Product selection callback with data: {selection}")
     
     # Handle back navigation
     if selection == "back_to_browse":
@@ -3468,95 +3472,83 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
     if selection == "back_to_categories":
         return await back_to_categories(update, context, inventory_manager, loggers)
     
+    if selection == "back_to_strain":
+        # Go back to strain selection
+        if "strain_type" in context.user_data:
+            del context.user_data["strain_type"]
+        
+        # Get category to pass to the strain selection
+        category = context.user_data.get("category")
+        if not category:
+            return await back_to_categories(update, context, inventory_manager, loggers)
+            
+        # Build the strain selection keyboard
+        keyboard = [
+            [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
+            [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
+            [InlineKeyboardButton("🍃 Hybrid", callback_data="hybrid")],
+            [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+        ]
+        
+        try:
+            await query.edit_message_text(
+                f"{EMOJI['buds']} Select Strain Type:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return STRAIN_TYPE
+        except Exception as e:
+            loggers["errors"].error(f"Error going back to strain selection: {e}")
+            # Try with a fresh message instead of editing
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"{EMOJI['buds']} Select Strain Type:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return STRAIN_TYPE
+    
+    # If it's a direct product selection
     category = context.user_data.get("category")
     
-    # If it's a brand or strain selection
-    if selection.startswith("brand_") or selection.startswith("strain_"):
-        # Extract the brand or strain
-        _, value = selection.split("_", 1)
-        
-        # Store for later use
-        context.user_data["selected_group"] = value
-        context.user_data["current_location"] = f"products_{value}"
-        
-        # Get all products for this brand/strain
-        products_by_tag, _, _ = await inventory_manager.get_inventory()
-        all_products = products_by_tag.get(PRODUCTS[category]["tag"], [])
-        
-        # Filter by brand or strain
-        filtered_products = []
-        if selection.startswith("brand_"):
-            filtered_products = [p for p in all_products if p.get("brand") == value]
-        else:
-            filtered_products = [p for p in all_products if p.get("strain") == value]
+    # Set location for tracking
+    context.user_data["current_location"] = f"product_{selection}"
+    
+    # Find the product
+    products_by_tag, products_by_strain, all_products = await inventory_manager.get_inventory_safe()
+    
+    selected_product = None
+    for p in all_products:
+        if p.get("key") == selection:
+            selected_product = p
+            break
             
-        # Build product buttons
-        keyboard = []
-        for product in filtered_products:
-            product_name = product.get("name", "Unknown")
-            product_key = product.get("key")
-            stock = product.get("stock", 0)
-            price = product.get("price", 0)
-            
-            if stock > 0:
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{product_name} - ₱{price:,.0f} ({stock} left)",
-                        callback_data=product_key
-                    )
-                ])
-                
-        # Add back buttons
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")])
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")])
-        
-        browse_by = context.user_data.get("browse_by", "")
-        if browse_by == "browse_by_brand":
-            header = f"{EMOJI['carts']} {value} Products:"
-        else:
-            header = f"{EMOJI['carts']} {value.capitalize()} Products:"
-            
+    if not selected_product:
         await query.edit_message_text(
-            header,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "Sorry, this product is no longer available.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            ])
         )
-        
         return PRODUCT_SELECTION
         
-    # If it's a direct product selection
-    else:
-        # Find the product
-        products_by_tag, products_by_strain, all_products = await inventory_manager.get_inventory()
-        
-        selected_product = None
-        for p in all_products:
-            if p.get("key") == selection:
-                selected_product = p
-                break
-                
-        if not selected_product:
-            await query.edit_message_text(
-                "Sorry, this product is no longer available.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-                ])
-            )
-            return PRODUCT_SELECTION
-            
-        # Store product details
-        context.user_data["product_key"] = selection
-        context.user_data["product_name"] = selected_product.get("name")
-        context.user_data["product_price"] = selected_product.get("price", 0)
-        context.user_data["product_stock"] = selected_product.get("stock", 0)
-        context.user_data["current_location"] = f"product_{selection}"
-        
-        # Ask for quantity
-        product_unit = PRODUCTS[category].get("unit", "units")
-        min_order = PRODUCTS[category].get("min_order", 1)
-        
+    # Store product details
+    context.user_data["product_key"] = selection
+    context.user_data["product_name"] = selected_product.get("name")
+    context.user_data["product_price"] = selected_product.get("price", 0)
+    context.user_data["product_stock"] = selected_product.get("stock", 0)
+    
+    # Ask for quantity
+    product_unit = PRODUCTS[category].get("unit", "units") if category in PRODUCTS else "units"
+    min_order = PRODUCTS[category].get("min_order", 1) if category in PRODUCTS else 1
+    
+    # Log the product selection
+    loggers["main"].info(
+        f"User {query.from_user.id} selected product: {selected_product.get('name')} ({selection})"
+    )
+    
+    try:
         await query.edit_message_text(
-            f"{EMOJI[category]} {selected_product.get('name')}\n\n"
+            f"{EMOJI.get(category, '🌿')} {selected_product.get('name')}\n\n"
             f"Price: ₱{selected_product.get('price', 0):,.0f}\n"
             f"Stock: {selected_product.get('stock', 0)} {product_unit}\n\n"
             f"Please enter the quantity (minimum {min_order} {product_unit}):",
@@ -3565,8 +3557,23 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE, inv
                 [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
             ])
         )
-        
-        return QUANTITY
+    except Exception as e:
+        # Handle message editing errors
+        loggers["errors"].error(f"Error displaying product details: {e}")
+        # Try sending a new message instead
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"{EMOJI.get(category, '🌿')} {selected_product.get('name')}\n\n"
+                 f"Price: ₱{selected_product.get('price', 0):,.0f}\n"
+                 f"Stock: {selected_product.get('stock', 0)} {product_unit}\n\n"
+                 f"Please enter the quantity (minimum {min_order} {product_unit}):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Browse", callback_data="back_to_browse")],
+                [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+            ])
+        )
+    
+    return QUANTITY
 
 async def handle_quantity_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
@@ -6944,6 +6951,16 @@ async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"DEBUG CALLBACK ERROR: Failed to handle navigation: {str(e)}")
     
+    # Try to handle product selection for any unhandled callback that seems like a product key
+    elif current_location and current_location.startswith("strain_selection") and category:
+        print(f"DEBUG CALLBACK: Attempting to handle product selection: {query.data}")
+        try:
+            # Update location to help with tracking
+            context.user_data["current_location"] = f"product_{query.data}"
+            return await select_product_wrapper(update, context)
+        except Exception as e:
+            print(f"DEBUG CALLBACK ERROR: Failed to handle product selection: {str(e)}")
+    
     # Don't modify the message or do anything else
     return
 
@@ -6976,6 +6993,24 @@ async def debug_state_tracking(update: Update, context: ContextTypes.DEFAULT_TYP
     # Log the state
     print(f"DEBUG STATE: User {user_id} | Chat {chat_id} | Location: {current_location} | Category: {category} | Update: {update_type} | Callback: {callback_data}")
 
+async def post_init(application: Application):
+    """
+    Runs after application is initialized but before polling starts.
+    Use this to perform initialization tasks.
+    """
+    print("DEBUG: Application initialized, performing post-init tasks")
+    
+    # Delete persistence file if it might be causing issues
+    if os.path.exists("bot_persistence") and os.environ.get("RESET_PERSISTENCE") == "true":
+        print("DEBUG: Removing persistence file due to RESET_PERSISTENCE flag")
+        try:
+            os.rename("bot_persistence", f"bot_persistence_backup_{int(time.time())}")
+            print("DEBUG: Persistence file backed up and removed")
+        except Exception as e:
+            print(f"DEBUG: Error backing up persistence file: {e}")
+    
+    print("DEBUG: Post-init tasks complete, bot ready to start")
+
 def main():
     """Set up the bot and start polling."""
     global loggers, google_apis, inventory_manager, order_manager, admin_panel
@@ -7007,7 +7042,12 @@ def main():
     
     try:
         # Initialize application with persistence and concurrency
-        app = ApplicationBuilder().token(TOKEN).persistence(persistence).concurrent_updates(True).build()
+        # Add the post_init parameter to the ApplicationBuilder
+        app = ApplicationBuilder().token(TOKEN) \
+                               .persistence(persistence) \
+                               .concurrent_updates(True) \
+                               .post_init(post_init) \
+                               .build()
         
         # Store start time
         app.bot_data["start_time"] = time.time()
@@ -7021,9 +7061,11 @@ def main():
         
         # Create admin panel with multiple admin IDs
         admin_panel = AdminPanel(app.bot, admin_ids, google_apis, order_manager, loggers)
+        
         # Set up error handlers
         app.add_error_handler(enhanced_error_handler)
         app.add_error_handler(error_handler)
+        
         # Add recovery command handlers
         app.add_handler(CommandHandler("reset", reset_command))
         app.add_handler(CommandHandler("help", help_command))
@@ -7033,21 +7075,23 @@ def main():
         app.add_handler(CommandHandler("debug", debug_command))  # Debug command for admin
         app.add_handler(CallbackQueryHandler(restart_conversation, pattern="^restart_conversation$"))
         app.add_handler(CallbackQueryHandler(get_help, pattern="^get_help$"))
+        
         # Updated with more specific pattern
         app.add_handler(CallbackQueryHandler(refresh_tracking, pattern="^refresh_tracking_[A-Z0-9-]+$"))
         app.add_handler(CallbackQueryHandler(contact_support, pattern="^contact_support$"))
-        # Remove the duplicate handler and make patterns more specific
+        
+        # Make patterns more specific
         app.add_handler(CallbackQueryHandler(start_wrapper, pattern="^start$"))
-        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_[A-Z0-9-]+$"))  # Match only valid order IDs
+        app.add_handler(CallbackQueryHandler(select_order, pattern="^select_order_[A-Z0-9-]+$"))
         app.add_handler(CallbackQueryHandler(cancel_tracking, pattern="^cancel_tracking$"))
         app.add_handler(CallbackQueryHandler(show_recent_orders, pattern="^show_recent_orders$"))
         app.add_handler(CallbackQueryHandler(enter_order_id, pattern="^enter_order_id$"))
         app.add_handler(CallbackQueryHandler(handle_start_shopping, pattern="^start_shopping$"))
+        
         # Schedule periodic checks for stuck conversations
         job_queue = app.job_queue
         job_queue.run_repeating(check_conversation_status, interval=600, first=600)  # Every 10 minutes
-
-        # Add this to your main() function after job_queue setup
+        
         async def timeout_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             """
             Periodic job to detect and recover from stalled conversations.
@@ -7098,26 +7142,9 @@ def main():
                     except Exception as e:
                         loggers["errors"].error(f"Error in timeout recovery for user {user_id}: {str(e)}")
                         continue  # Continue checking other users
-
+        
         # Add this line to your job_queue setup in main()
         job_queue.run_repeating(timeout_recovery_job, interval=60, first=90)  # Run every minute, start after 90 seconds
-    
-        # Admin search conversation handler
-        admin_search_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(admin_panel.search_order_prompt, pattern="^search_order$")],
-            states={
-                ADMIN_SEARCH: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.handle_admin_search)
-                ],
-            },
-            fallbacks=[
-                CommandHandler("cancel", cancel),
-                CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$")
-            ],
-            name="admin_search_conversation",
-            persistent=True,
-            conversation_timeout=300  # 5 minutes timeout
-        )
         
         async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
             """Periodic job to clean up resources and prevent memory leaks"""
@@ -7159,18 +7186,16 @@ def main():
         # Schedule cleanup every 12 hours
         job_queue.run_repeating(cleanup_job, interval=43200, first=3600)  # 12 hours, first run after 1 hour
 
-
-
         # Set up conversation handler for main ordering flow
         conversation_handler = ConversationHandler(
             entry_points=[CommandHandler("start", start_wrapper)],
             states={
                 CATEGORY: [
-                    # Match any string callback in CATEGORY state
+                    # Match any callback in CATEGORY state
                     CallbackQueryHandler(choose_category_wrapper)
                 ],
                 STRAIN_TYPE: [
-                    # Match any string callback in STRAIN_TYPE state
+                    # Match any callback in STRAIN_TYPE state
                     CallbackQueryHandler(choose_strain_type_wrapper)
                 ],
                 BROWSE_BY: [
@@ -7178,8 +7203,11 @@ def main():
                     CallbackQueryHandler(browse_carts_by_wrapper)
                 ],
                 PRODUCT_SELECTION: [
-                    # Handle all product selection callbacks
-                    CallbackQueryHandler(select_product_wrapper)
+                    # Handle all product selection callbacks with detailed debugging
+                    CallbackQueryHandler(lambda u, c: (
+                        print(f"DEBUG: Product selection callback: {u.callback_query.data}"),
+                        select_product_wrapper(u, c))[1]
+                    )
                 ],
                 QUANTITY: [
                     CallbackQueryHandler(handle_back_navigation_wrapper, pattern="^back_"),
@@ -7211,9 +7239,6 @@ def main():
             persistent=True,
             conversation_timeout=900  # 15 minutes timeout
         )
-        
-        # Register the global start handler
-        app.add_handler(CommandHandler("start", global_start, filters=~filters.UpdateType.EDITED_MESSAGE))
 
         # Order tracking conversation handler
         tracking_handler = ConversationHandler(
@@ -7235,7 +7260,7 @@ def main():
             persistent=True,
             conversation_timeout=300  # 5 minutes timeout
         )  
-    
+
         # Admin tracking link input handler
         admin_tracking_handler = ConversationHandler(
             entry_points=[CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_")],
@@ -7250,15 +7275,44 @@ def main():
             persistent=True,
             conversation_timeout=300  # 5 minutes timeout
         )
+
+        # Admin search conversation handler
+        admin_search_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(admin_panel.search_order_prompt, pattern="^search_order$")],
+            states={
+                ADMIN_SEARCH: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel.handle_admin_search)
+                ],
+            },
+            fallbacks=[
+                CommandHandler("cancel", cancel),
+                CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$")
+            ],
+            name="admin_search_conversation",
+            persistent=True,
+            conversation_timeout=300  # 5 minutes timeout
+        )
+
+        # ====== START OF NEW CODE FOR HANDLER REGISTRATION ======
         
-        # Admin command handler - route to the admin panel class
+        # First register the main conversation handler (highest priority)
+        print("DEBUG: Registering main conversation handler")
+        app.add_handler(conversation_handler, group=0)  # Use group 0 for highest priority
+        
+        # Register order tracking handler
+        print("DEBUG: Registering tracking handler")
+        app.add_handler(tracking_handler)
+        
+        # Register admin handlers
+        print("DEBUG: Registering admin handlers")
+        app.add_handler(admin_tracking_handler)
         app.add_handler(CommandHandler("admin", lambda update, context: admin_panel.show_panel(update, context)))
         app.add_handler(CommandHandler("health", health_check))
         
-        # Admin panel callback handlers
+        # Register admin panel callback handlers
+        print("DEBUG: Registering admin callback handlers")
         app.add_handler(CallbackQueryHandler(admin_panel.back_to_admin, pattern="^back_to_admin$"))
         app.add_handler(CallbackQueryHandler(admin_panel.view_orders, pattern="^view_orders$"))
-        # Updated with more specific patterns
         app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.view_orders(update, context), pattern="^filter_[a-z_]+$"))
         app.add_handler(CallbackQueryHandler(lambda update, context: admin_panel.manage_order(update, context), pattern="^manage_order_[A-Z0-9-]+$"))
         app.add_handler(CallbackQueryHandler(admin_panel.update_order_status, pattern="^update_status_[A-Z0-9-]+$"))
@@ -7268,34 +7322,41 @@ def main():
         app.add_handler(CallbackQueryHandler(admin_panel.add_tracking_link, pattern="^add_tracking_link$"))
         app.add_handler(admin_search_handler)
         app.add_handler(CallbackQueryHandler(admin_panel.review_payments, pattern="^approve_payments$"))
-        # Updated with more specific patterns
         app.add_handler(CallbackQueryHandler(admin_panel.review_specific_payment, pattern="^review_payment_[A-Z0-9-]+$"))
         app.add_handler(CallbackQueryHandler(admin_panel.process_payment_action, pattern="^(approve|reject)_payment_[A-Z0-9-]+$"))
         
-        # Add force restart command
+        # Register utility and recovery commands
+        print("DEBUG: Registering utility handlers")
         app.add_handler(CommandHandler("restart", force_restart))
         app.add_handler(CommandHandler("force_reset", force_reset_command))
-
-        # This ensures the /start command is always accessible
-        app.add_handler(CommandHandler("start", lambda update, context: (context.user_data.clear(), start_wrapper(update, context)),filters=~filters.UpdateType.EDITED_MESSAGE))
-
-        # Register the main handlers
-        app.add_handler(admin_tracking_handler)
-        app.add_handler(tracking_handler)
-        app.add_handler(conversation_handler)
         app.add_handler(CommandHandler("categories", back_to_categories_wrapper))
         
-        # Register handler for unknown commands - must be added AFTER all other command handlers
+        # Register global start command handler
+        app.add_handler(CommandHandler("start", lambda update, context: (context.user_data.clear(), start_wrapper(update, context)),
+                                      filters=~filters.UpdateType.EDITED_MESSAGE))
+        
+        # Register the unknown command handler
+        print("DEBUG: Registering unknown command handler")
         unknown_command_handler = MessageHandler(
             filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE, 
             command_not_found
         )
         app.add_handler(unknown_command_handler)
-        app.add_handler(CallbackQueryHandler(debug_callback))
+        
+        # Finally, register the debug callback handler as the LAST handler
+        print("DEBUG: Registering debug callback handler as fallback")
+        app.add_handler(CallbackQueryHandler(debug_callback), group=999)  # Use high group number to ensure it runs last
+        
+        # Debug registered handlers
+        print("DEBUG: Registered handlers:")
+        for group in app.handlers.keys():
+            print(f"DEBUG: - Group {group} has {len(app.handlers[group])} handlers")
+            
+        # ====== END OF NEW CODE FOR HANDLER REGISTRATION ======
 
         # Log the startup
-        loggers["main"].info("Bot is running...")
-        print("Bot is running...")
+        loggers["main"].info("Bot is running with debugging enabled...")
+        print("Bot is running with debugging enabled...")
         
         # Start the bot
         app.run_polling(allowed_updates=Update.ALL_TYPES)
