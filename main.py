@@ -493,7 +493,7 @@ def log_admin_action(logger, admin_id, action, order_id=None):
 
 # ---------------------------- Google API Services ----------------------------
 class GoogleAPIsManager:
-    """Manage Google API connections with rate limiting and backoff."""
+    """Manage Google API connections with rate limiting, backoff, and enhanced caching."""
     
     def __init__(self, loggers):
         """
@@ -510,6 +510,16 @@ class GoogleAPIsManager:
         self._sheet = None
         self._inventory_sheet = None
         self._sheet_initialized = False
+        
+        # Enhanced cache system
+        self.cache = {
+            "inventory": {"data": None, "timestamp": 0},
+            "orders": {"data": None, "timestamp": 0},
+            "sheets": {"data": None, "timestamp": 0},
+            "drive": {"data": None, "timestamp": 0}
+        }
+        self.cache_hits = 0
+        self.cache_misses = 0
         
     async def get_sheet_client(self):
         """
@@ -606,15 +616,73 @@ class GoogleAPIsManager:
             self.loggers["errors"].error(f"Failed to initialize sheets: {e}")
             # Return None or provide fallback behavior
             return None, None
+        
+    def _check_cache(self, cache_key, max_age=None):
+        """
+        Check if cached data exists and is still valid.
+        
+        Args:
+            cache_key (str): The key for the cached data
+            max_age (int, optional): Maximum age of cache in seconds
+                                     If None, uses CACHE_EXPIRY values
+                                     
+        Returns:
+            tuple: (is_valid, cached_data)
+        """
+        if not max_age:
+            # Use default cache expiry time based on the key
+            for k, v in CACHE_EXPIRY.items():
+                if k in cache_key:
+                    max_age = v
+                    break
+            # Default to 60 seconds if no match
+            if not max_age:
+                max_age = 60
+                
+        cache_entry = self.cache.get(cache_key)
+        if not cache_entry or not cache_entry.get("data"):
+            self.cache_misses += 1
+            return False, None
+            
+        # Check if cache is still fresh
+        if time.time() - cache_entry.get("timestamp", 0) > max_age:
+            self.cache_misses += 1
+            return False, None
+            
+        # Cache hit
+        self.cache_hits += 1
+        return True, cache_entry.get("data")
+        
+    def _update_cache(self, cache_key, data):
+        """
+        Update the cache with new data.
+        
+        Args:
+            cache_key (str): The key for the cached data
+            data: The data to cache
+            
+        Returns:
+            The cached data
+        """
+        self.cache[cache_key] = {
+            "data": data,
+            "timestamp": time.time()
+        }
+        return data
     
     async def fetch_inventory(self):
         """
         Fetch inventory data from Google Sheets including tags and stock.
-        Handles errors with graceful fallback to default inventory.
+        Uses enhanced caching to reduce API calls.
         
         Returns:
             tuple: (products_by_tag, products_by_strain, all_products)
         """
+        # Check cache first
+        is_valid, cached_data = self._check_cache("inventory")
+        if is_valid:
+            return cached_data
+        
         products_by_tag = {'buds': [], 'local': [], 'carts': [], 'edibs': []}
         products_by_strain = {'indica': [], 'sativa': [], 'hybrid': []}
         all_products = []
@@ -624,7 +692,8 @@ class GoogleAPIsManager:
             _, inventory_sheet = await self.initialize_sheets()
             
             if not inventory_sheet:
-                return self._create_default_inventory()
+                default_inventory = self._create_default_inventory()
+                return self._update_cache("inventory", default_inventory)
             
             # Make a rate-limited request
             await self._rate_limit_request('inventory')
@@ -666,12 +735,14 @@ class GoogleAPIsManager:
                 if strain_type in products_by_strain:
                     products_by_strain[strain_type].append(product)
             
-            return products_by_tag, products_by_strain, all_products
+            result = (products_by_tag, products_by_strain, all_products)
+            return self._update_cache("inventory", result)
             
         except Exception as e:
             self.loggers["errors"].error(f"Error fetching inventory: {e}")
             # Fallback to default inventory
-            return self._create_default_inventory()
+            default_inventory = self._create_default_inventory()
+            return self._update_cache("inventory", default_inventory)
             
     def _create_default_inventory(self):
         """Create a default inventory when API access fails."""
@@ -865,7 +936,7 @@ class GoogleAPIsManager:
     
     async def get_order_details(self, order_id):
         """
-        Get details for a specific order.
+        Get details for a specific order with caching for frequent requests.
         
         Args:
             order_id (str): Order ID to look up
@@ -873,6 +944,12 @@ class GoogleAPIsManager:
         Returns:
             dict: Order details or None if not found
         """
+        # For active orders, use a shorter cache expiry to get updates
+        # Check if we have this order already cached
+        cache_key = f"order_{order_id}"
+        is_valid, cached_data = self._check_cache(cache_key, max_age=30)  # Short cache time for orders
+        if is_valid:
+            return cached_data
 
         try:
             # Initialize sheets
@@ -892,9 +969,11 @@ class GoogleAPIsManager:
             for order in orders:
                 if (order.get('Order ID') == order_id and 
                     order.get('Product') == 'COMPLETE ORDER'):
-                    return order
+                    # Cache this order's details
+                    return self._update_cache(cache_key, order)
             
-            return None
+            # If not found, cache a None value briefly to prevent repeated lookups for invalid IDs
+            return self._update_cache(cache_key, None)
             
         except Exception as e:
             self.loggers["errors"].error(f"Failed to get order details: {e}")
@@ -917,6 +996,24 @@ class GoogleAPIsManager:
         
         # Update the last request time
         self.last_request_time[api_name] = time.time()
+
+    def get_cache_stats(self):
+        """
+        Get statistics on cache performance.
+        
+        Returns:
+            dict: Cache statistics
+        """
+        total_requests = self.cache_hits + self.cache_misses
+        hit_ratio = 0 if total_requests == 0 else (self.cache_hits / total_requests)
+        
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_ratio": hit_ratio,
+            "total_requests": total_requests,
+            "cache_entries": len(self.cache)
+        }
 
 # ---------------------------- Utility Functions ----------------------------
 def is_valid_order_id(order_id):
@@ -5430,6 +5527,17 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
     status_text += f"\n{EMOJI['time']} Uptime: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+    
+    # Add cache statistics
+    try:
+        cache_stats = google_apis.get_cache_stats()
+        status_text += f"\n\n{EMOJI['inventory']} Cache Statistics:"
+        status_text += f"\n- Cache Hits: {cache_stats['cache_hits']}"
+        status_text += f"\n- Cache Misses: {cache_stats['cache_misses']}"
+        status_text += f"\n- Hit Ratio: {cache_stats['hit_ratio']:.1%}"
+        status_text += f"\n- Total Requests: {cache_stats['total_requests']}"
+    except Exception as e:
+        status_text += f"\n\nCache statistics unavailable: {str(e)}"
     
     await message.edit_text(status_text)
 
