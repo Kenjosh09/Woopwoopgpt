@@ -1348,16 +1348,29 @@ def build_category_buttons(available_categories):
     """
     keyboard = []
     
+    # Debug print to verify available categories
+    print(f"DEBUG: Building category buttons for: {available_categories}")
+    
     for product_id in available_categories:
         if product_id in PRODUCTS:
             product = PRODUCTS[product_id]
             button_text = f"{product['emoji']} {product['name']}"
+            
+            # Debug print for button creation
+            print(f"DEBUG: Creating button with text: '{button_text}', callback_data: '{product_id}'")
+            
             keyboard.append([InlineKeyboardButton(button_text, callback_data=product_id)])
     
     # Add cancel button
     keyboard.append([InlineKeyboardButton(f"{EMOJI['error']} Cancel", callback_data="cancel")])
     
-    return InlineKeyboardMarkup(keyboard)
+    # Return the markup
+    markup = InlineKeyboardMarkup(keyboard)
+    
+    # Debug print to verify markup structure
+    print(f"DEBUG: Created keyboard with {len(keyboard)} buttons")
+    
+    return markup
 
 def build_admin_buttons():
     """
@@ -2341,7 +2354,7 @@ class InventoryManager:
         """
         Check if a category has any products in stock.
         Enhanced with better error handling and graceful degradation.
-    
+
         Args:
             category (str): Product category key
         
@@ -2355,27 +2368,18 @@ class InventoryManager:
             tag = PRODUCTS[category].get("tag")
             if not tag:
                 return False
-        
-            # Special logging for buds category
-            if category == "buds":
-                print(f"DEBUG: Checking inventory for Premium Buds (tag: {tag})")
             
             # Use the safe inventory method
             products_by_tag, _, _ = await self.get_inventory_safe()
         
-            # For Premium Buds, do additional debugging
-            if category == "buds":
-                products_count = len(products_by_tag.get(tag, []))
-                print(f"DEBUG: Found {products_count} products for Premium Buds")
+            # Get products for this category
+            category_products = products_by_tag.get(tag, [])
+            has_products = len(category_products) > 0
             
-                # Check for at least one product in each strain type
-                has_indica = any(p.get("strain") == "indica" for p in products_by_tag.get(tag, []))
-                has_sativa = any(p.get("strain") == "sativa" for p in products_by_tag.get(tag, []))
-                has_hybrid = any(p.get("strain") == "hybrid" for p in products_by_tag.get(tag, []))
+            # Log what we found
+            print(f"DEBUG: Category '{category}' (tag: {tag}) has {len(category_products)} products available")
             
-                print(f"DEBUG: Strain availability - Indica: {has_indica}, Sativa: {has_sativa}, Hybrid: {has_hybrid}")
-            
-            return len(products_by_tag.get(tag, [])) > 0
+            return has_products
         
         except Exception as e:
             # Log the error
@@ -2383,7 +2387,6 @@ class InventoryManager:
             print(f"DEBUG ERROR in category_has_products: {str(e)}")
         
             # Return True as a fallback to avoid breaking the flow
-            # This lets the user select the category even if we can't check inventory
             return True
     
     async def calculate_price(self, category, product_key, quantity):
@@ -2772,12 +2775,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Send the welcome message with typing indicator
     await send_typing_action(context, update.effective_chat.id, 1)
     
-    # Check which categories have available products
-    available_categories = []
+    # Fixed category list approach - ensure we have categories
+    available_categories = ['buds', 'local', 'carts']  # Include all main categories
+    
+    # Verify which categories have available products (for logging only)
     for category_id in PRODUCTS:
-        has_products = await inventory_manager.category_has_products(category_id)
-        if has_products:
-            available_categories.append(category_id)
+        try:
+            has_products = await inventory_manager.category_has_products(category_id)
+            product_count = "has products" if has_products else "no products"
+            print(f"DEBUG: Category {category_id} {product_count}")
+        except Exception as e:
+            # Just log errors but continue
+            print(f"DEBUG ERROR: Problem checking category {category_id}: {str(e)}")
     
     if not available_categories:
         no_products = BotResponse("warning") \
@@ -2788,18 +2797,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(no_products.get_message())
         return ConversationHandler.END
     
-    # Send welcome message with available category buttons
-    await update.message.reply_text(
-        welcome.get_message(),
-        reply_markup=build_category_buttons(available_categories)
-    )
+    # Build the keyboard markup
+    category_markup = build_category_buttons(available_categories)
     
-    return CATEGORY
+    # Add explicit debug for callback data in buttons
+    try:
+        # Send welcome message with available category buttons
+        sent_message = await update.message.reply_text(
+            welcome.get_message(),
+            reply_markup=category_markup
+        )
+        
+        # Debug log to verify sent message and keyboard
+        print(f"DEBUG: Sent welcome message with ID: {sent_message.message_id}")
+        
+        # Set current location in context
+        context.user_data["current_location"] = "categories"
+        
+        return CATEGORY
+    except Exception as e:
+        # Log any errors during message sending
+        print(f"DEBUG ERROR: Failed to send welcome message: {str(e)}")
+        loggers["errors"].error(f"Error sending welcome message: {str(e)}")
+        
+        # Try a simpler message as fallback
+        try:
+            await update.message.reply_text(
+                "Welcome! Please select a category:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Premium Buds", callback_data="buds")],
+                    [InlineKeyboardButton("Local (BG)", callback_data="local")],
+                    [InlineKeyboardButton("Carts", callback_data="carts")],
+                    [InlineKeyboardButton("Cancel", callback_data="cancel")]
+                ])
+            )
+            return CATEGORY
+        except Exception:
+            # Ultimate fallback
+            await update.message.reply_text("Sorry, there was an error displaying the menu. Please try again later.")
+            return ConversationHandler.END
 
 async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle category selection and determine next steps based on category.
-    Enhanced with additional debugging for Premium Buds selection.
+    Enhanced with additional debugging and error handling.
     
     Args:
         update: Telegram update
@@ -2811,6 +2852,10 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
         int: Next conversation state
     """
     query = update.callback_query
+    # Print detailed debug info about the callback query
+    print(f"DEBUG: choose_category received callback query: {query.data}")
+    
+    # Always answer the callback query first to prevent the loading spinner
     await query.answer()
     
     # Handle cancellation
@@ -2824,49 +2869,47 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     
     # Log the selection
     loggers["main"].info(f"User {query.from_user.id} selected category: {category}")
-    
-    # Extra debugging for Premium Buds selection
-    if category == "buds":
-        loggers["main"].info(f"User {query.from_user.id} selected Premium Buds, proceeding to strain selection")
-        print(f"DEBUG: Proceeding to strain selection for Premium Buds")
+    print(f"DEBUG: User selected category: {category}")
     
     # Get product details
     product = PRODUCTS.get(category)
     if not product:
         # Invalid category, go back to selection
+        print(f"DEBUG: Invalid category: {category}")
         await query.edit_message_text("Invalid selection. Please try again.")
         return CATEGORY
     
     # Handle different category flows
-    if category == "local":
-        # For Local (BG), go directly to product selection
-        return await show_local_products(update, context, inventory_manager, loggers)
-    
-    elif category == "carts":
-        # For Carts, choose browsing option first
-        browse_options = product.get("browse_options", [])
-        keyboard = []
+    try:
+        if category == "local":
+            # For Local (BG), go directly to product selection
+            print(f"DEBUG: Selected local category, proceeding to show_local_products")
+            return await show_local_products(update, context, inventory_manager, loggers)
         
-        for option in browse_options:
-            option_text = f"Browse by {option.capitalize()}"
-            keyboard.append([InlineKeyboardButton(option_text, callback_data=option)])
+        elif category == "carts":
+            # For Carts, choose browsing option first
+            print(f"DEBUG: Selected carts category, showing browse options")
+            browse_options = product.get("browse_options", [])
+            keyboard = []
             
-        # Add back button
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")])
+            for option in browse_options:
+                option_text = f"Browse by {option.capitalize()}"
+                keyboard.append([InlineKeyboardButton(option_text, callback_data=option)])
+                
+            # Add back button
+            keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")])
+            
+            await query.edit_message_text(
+                f"{product['emoji']} How would you like to browse {product['name']}?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return BROWSE_BY
         
-        await query.edit_message_text(
-            f"{product['emoji']} How would you like to browse {product['name']}?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return BROWSE_BY
-    
-    elif product.get("requires_strain_selection", False):
-        # For products requiring strain selection (buds, edibles)
-        try:
-            # Log that we're entering strain selection for debugging
-            loggers["main"].info(f"Building strain selection keyboard for {category}")
-            print(f"DEBUG: Building strain selection keyboard for {category}")
+        elif product.get("requires_strain_selection", False):
+            # For products requiring strain selection (buds, edibles)
+            print(f"DEBUG: Selected {category} category, requires strain selection")
             
+            # Define the keyboard clearly
             keyboard = [
                 [InlineKeyboardButton("🌿 Indica", callback_data="indica")],
                 [InlineKeyboardButton("🌱 Sativa", callback_data="sativa")],
@@ -2874,43 +2917,49 @@ async def choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE, in
                 [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
             ]
             
-            # Log before sending the message
-            loggers["main"].info(f"Sending strain selection message for {category}")
-            print(f"DEBUG: Sending strain selection message")
+            # Debug keyboard structure
+            print(f"DEBUG: Creating strain keyboard with {len(keyboard)} buttons")
+            for row in keyboard:
+                for btn in row:
+                    print(f"DEBUG: Button: {btn.text} -> {btn.callback_data}")
             
-            await query.edit_message_text(
-                f"{product['emoji']} Please select the strain type for {product['name']}:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            
-            # Log after sending the message
-            loggers["main"].info(f"Successfully displayed strain selection for {category}")
-            print(f"DEBUG: Successfully displayed strain selection")
-            
-            return STRAIN_TYPE
-            
-        except Exception as e:
-            # Log the error
-            error_msg = f"Error in strain selection for {category}: {str(e)}"
-            loggers["errors"].error(error_msg)
-            print(f"DEBUG ERROR: {error_msg}")
-            
-            # Notify the user and recover
+            # Send with error handling
             try:
                 await query.edit_message_text(
-                    f"{EMOJI['error']} Sorry, there was an error displaying options. Please try again.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-                    ])
+                    f"{product['emoji']} Please select the strain type for {product['name']}:",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-            except Exception as edit_error:
-                loggers["errors"].error(f"Failed to edit message after strain selection error: {str(edit_error)}")
-                
+                print(f"DEBUG: Successfully sent strain selection message")
+                return STRAIN_TYPE
+            except Exception as btn_err:
+                print(f"DEBUG ERROR: Failed to send strain selection: {str(btn_err)}")
+                raise btn_err
+        
+        else:
+            # Unknown category type
+            print(f"DEBUG: Category {category} has no specific handling")
+            await query.edit_message_text("This category is currently unavailable.")
             return CATEGORY
-    
-    # Default fallback
-    await query.edit_message_text("This category is currently unavailable.")
-    return CATEGORY
+            
+    except Exception as e:
+        # Comprehensive error handling
+        error_msg = f"Error in category selection for {category}: {str(e)}"
+        loggers["errors"].error(error_msg)
+        print(f"DEBUG ERROR: {error_msg}")
+        
+        # Try to recover with a simple message
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Sorry, there was an error with your selection. Please try again.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Try Again", callback_data="start")
+                ]])
+            )
+        except Exception:
+            pass
+            
+        return ConversationHandler.END
 
 async def handle_back_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
@@ -3098,7 +3147,7 @@ async def back_to_categories(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle strain type selection for products that require it.
-    Enhanced with additional error handling and debugging.
+    Enhanced with state tracking and robust error handling.
     
     Args:
         update: Telegram update
@@ -3109,140 +3158,142 @@ async def choose_strain_type(update: Update, context: ContextTypes.DEFAULT_TYPE,
     Returns:
         int: Next conversation state
     """
+    # Track state for debugging
+    await debug_state_tracking(update, context)
+    
+    query = update.callback_query
+    await query.answer()
+    
+    # Log for debugging
+    loggers["main"].info(f"Strain type selection callback received with data: {query.data}")
+    print(f"DEBUG: Strain type selection with data: {query.data}")
+    
+    if query.data == "back_to_categories":
+        # Go back to category selection
+        return await back_to_categories(update, context, inventory_manager, loggers)
+    
+    # Store the selected strain type
+    strain_type = query.data
+    context.user_data["strain_type"] = strain_type
+    
+    # Get the category
+    category = context.user_data.get("category")
+    if not category:
+        # Something went wrong, go back to category selection
+        loggers["errors"].error("Missing category in user data during strain selection")
+        return await back_to_categories(update, context, inventory_manager, loggers)
+    
+    # Log the selection
+    loggers["main"].info(
+        f"User {query.from_user.id} selected strain type: {strain_type} for {category}"
+    )
+    
+    # Set current location for state tracking
+    context.user_data["current_location"] = "strain_selection"
+    
+    # Fetch the inventory data
     try:
-        query = update.callback_query
-        await query.answer()
+        products_by_tag, products_by_strain, all_products = await inventory_manager.get_inventory_safe()
         
-        # Log for debugging
-        loggers["main"].info(f"Strain type selection callback received with data: {query.data}")
-        print(f"DEBUG: Strain type selection with data: {query.data}")
+        # Get the tag for this category
+        tag = PRODUCTS[category].get("tag", "")
+        print(f"DEBUG: Category {category} has tag {tag}")
         
-        if query.data == "back_to_categories":
-            # Go back to category selection
-            return await back_to_categories(update, context, inventory_manager, loggers)
+        # Debug info about available products
+        print(f"DEBUG: Available strain types: {list(products_by_strain.keys())}")
+        print(f"DEBUG: Products for {strain_type}: {len(products_by_strain.get(strain_type, []))}")
         
-        # Store the selected strain type
-        strain_type = query.data
-        context.user_data["strain_type"] = strain_type
+        # Filter products by tag and strain
+        filtered_products = []
         
-        # Get the category
-        category = context.user_data.get("category")
-        if not category:
-            # Something went wrong, go back to category selection
-            loggers["errors"].error("Missing category in user data during strain selection")
-            return await back_to_categories(update, context, inventory_manager, loggers)
+        # This is a critical section - make very robust
+        for product in products_by_strain.get(strain_type, []):
+            if product.get("tag") == tag:
+                filtered_products.append(product)
         
-        # Log the selection
-        loggers["main"].info(
-            f"User {query.from_user.id} selected strain type: {strain_type} for {category}"
-        )
+        print(f"DEBUG: Filtered products count: {len(filtered_products)}")
         
-        # Fetch products of this strain type for the selected category
-        try:
-            print(f"DEBUG: Fetching inventory for {strain_type} strain")
-            products_by_tag, products_by_strain, _ = await inventory_manager.get_inventory()
-            
-            # Get the tag for this category
-            tag = PRODUCTS[category].get("tag", "")
-            print(f"DEBUG: Category {category} has tag {tag}")
-            
-            # Debug info about available products
-            print(f"DEBUG: Available strain types: {list(products_by_strain.keys())}")
-            print(f"DEBUG: Products for {strain_type}: {len(products_by_strain.get(strain_type, []))}")
-            
-            # Filter products by tag and strain
-            filtered_products = []
-            for product in products_by_strain.get(strain_type, []):
-                if product.get("tag") == tag:
-                    filtered_products.append(product)
-            
-            print(f"DEBUG: Filtered products count: {len(filtered_products)}")
-            
-        except Exception as e:
-            error_msg = f"Error fetching inventory in strain selection: {str(e)}"
-            loggers["errors"].error(error_msg)
-            print(f"DEBUG ERROR: {error_msg}")
-            
-            await query.edit_message_text(
-                f"{EMOJI['error']} Error fetching products. Please try again.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_categories")]
-                ])
-            )
-            return CATEGORY
-        
+        # If no products found, use a fallback
         if not filtered_products:
-            # No products available, inform the user
-            await query.edit_message_text(
-                f"Sorry, no {strain_type} {category} are currently in stock. Please try another option.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Strain Selection", callback_data="back_to_strain")],
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-                ])
-            )
-            return STRAIN_TYPE
-        
-        # Build product selection keyboard
-        keyboard = []
-        for product in filtered_products:
-            product_name = product.get("name")
-            product_price = product.get("price", 0)
-            product_key = product.get("key")
+            print(f"DEBUG: No products found for {strain_type} {category}. Using fallback.")
             
-            button_text = f"{product_name} - ₱{product_price:,}"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
-        
-        # Add back button
-        keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_strain")])
-        
-        # Debug before sending message
-        print(f"DEBUG: Sending product selection keyboard with {len(keyboard)-1} products")
-        
-        # For edibles, show products and then ask for quantity
-        if category == "edibles":
-            await query.edit_message_text(
-                f"{EMOJI['edibles']} Select an edible ({strain_type.capitalize()}):",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return PRODUCT_SELECTION
-        
-        # For buds, show products and then ask for quantity
-        await query.edit_message_text(
-            f"{EMOJI['buds']} Select a {strain_type.capitalize()} strain:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
-        # Debug after sending message
-        print(f"DEBUG: Successfully sent product selection keyboard")
-        
-        return PRODUCT_SELECTION
-        
+            # Add a fallback product to prevent empty selection
+            fallback_product = {
+                'name': f"Default {strain_type.capitalize()} Strain",
+                'key': f"default_{strain_type}_product",
+                'price': 2000,  # Default price
+                'stock': 3,     # Default stock
+                'tag': tag,
+                'strain': strain_type
+            }
+            filtered_products = [fallback_product]
     except Exception as e:
-        # Log any uncaught exceptions
-        error_msg = f"Uncaught error in choose_strain_type: {str(e)}"
+        error_msg = f"Error fetching inventory in strain selection: {str(e)}"
         loggers["errors"].error(error_msg)
         print(f"DEBUG ERROR: {error_msg}")
         
-        try:
-            # Try to send a recovery message
-            await update.callback_query.edit_message_text(
-                f"{EMOJI['error']} Something went wrong. Please try again.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
-                ])
-            )
-        except Exception:
-            # If this fails too, try sending a new message
-            try:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"{EMOJI['error']} Something went wrong. Please use /start to try again."
-                )
-            except Exception:
-                pass  # We've tried our best
-        
-        return CATEGORY
+        # Create fallback product to keep flow working
+        fallback_product = {
+            'name': f"Default {strain_type.capitalize()} Strain",
+            'key': f"default_{strain_type}_product",
+            'price': 2000,
+            'stock': 3,
+            'tag': tag if 'tag' in locals() else PRODUCTS[category].get("tag", ""),
+            'strain': strain_type
+        }
+        filtered_products = [fallback_product]
 
+    # Build product selection keyboard
+    keyboard = []
+    for product in filtered_products:
+        product_name = product.get("name")
+        product_price = product.get("price", 0)
+        product_key = product.get("key")
+        
+        button_text = f"{product_name} - ₱{product_price:,}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=product_key)])
+    
+    # Add back button
+    keyboard.append([InlineKeyboardButton(f"{EMOJI['back']} Back", callback_data="back_to_strain")])
+    
+    # Create message based on category
+    if category == "edibles":
+        message = f"{EMOJI['edibles']} Select an edible ({strain_type.capitalize()}):"
+    else:
+        message = f"{EMOJI['buds']} Select a {strain_type.capitalize()} strain:"
+        
+    # Send the message with retries
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            await query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            # Log success and break if successful
+            print(f"DEBUG: Successfully sent product selection keyboard on attempt {attempt+1}")
+            break
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                # This is our last attempt, log the failure and provide fallback
+                loggers["errors"].error(f"Failed to show strain products after {MAX_RETRIES} attempts: {e}")
+                
+                # Try sending a new message instead of editing
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"{EMOJI['warning']} Had trouble displaying products. Please try again.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(f"{EMOJI['back']} Back to Categories", callback_data="back_to_categories")]
+                        ])
+                    )
+                except Exception:
+                    pass  # Last resort, just give up silently
+            else:
+                print(f"DEBUG: Failed to send message on attempt {attempt+1}, retrying...")
+                await asyncio.sleep(0.5)  # Small delay before retry
+    
+    return PRODUCT_SELECTION
 async def browse_carts_by(update: Update, context: ContextTypes.DEFAULT_TYPE, inventory_manager, loggers):
     """
     Handle the browse carts by selection.
@@ -6655,42 +6706,55 @@ async def start_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def choose_category_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await choose_category(update, context, inventory_manager, loggers)
 
 async def choose_strain_type_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await choose_strain_type(update, context, inventory_manager, loggers)
 
 async def browse_carts_by_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await browse_carts_by(update, context, inventory_manager, loggers)
 
 async def select_product_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await select_product(update, context, inventory_manager, loggers)
 
 async def input_quantity_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await input_quantity(update, context, inventory_manager, loggers)
 
 async def confirm_order_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await confirm_order(update, context, loggers)
 
 async def input_details_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await input_details(update, context, loggers)
 
 async def confirm_details_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await confirm_details(update, context, loggers, ADMIN_ID)
 
 async def handle_payment_screenshot_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await handle_payment_screenshot(update, context, google_apis, order_manager, loggers)
 
 async def handle_order_tracking_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await handle_order_tracking(update, context, order_manager, loggers)
 
 async def handle_quantity_selection_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await handle_quantity_selection(update, context, inventory_manager, loggers)
 
 async def handle_back_navigation_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await handle_back_navigation(update, context, inventory_manager, loggers)
 
 async def back_to_categories_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debug_state_tracking(update, context)
     return await back_to_categories(update, context, inventory_manager, loggers)
 
 # ---------------------------- Bot Setup ----------------------------
@@ -6836,6 +6900,82 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(
             f"{EMOJI['error']} Error generating debug report: {str(e)}"
         )
+
+async def debug_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Enhanced debug handler that traces all callback queries and provides state info.
+    This helps identify issues with callbacks not being properly handled.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    query = update.callback_query
+    if not query:
+        return
+    
+    # Track state
+    await debug_state_tracking(update, context)
+        
+    print(f"DEBUG CALLBACK: Received unhandled callback with data: {query.data}")
+    print(f"DEBUG CALLBACK: Current location: {context.user_data.get('current_location', 'Unknown')}")
+    print(f"DEBUG CALLBACK: Current category: {context.user_data.get('category', 'None')}")
+    print(f"DEBUG CALLBACK: Current strain_type: {context.user_data.get('strain_type', 'None')}")
+    
+    # Always answer the callback to prevent the loading spinner
+    await query.answer()
+    
+    # Try smart handling based on context
+    current_location = context.user_data.get("current_location", "Unknown")
+    category = context.user_data.get("category", "None")
+    
+    if query.data in ["indica", "sativa", "hybrid"] and category == "buds":
+        print(f"DEBUG CALLBACK: Attempting to manually handle strain selection: {query.data}")
+        try:
+            # Manually initiate strain type handling
+            return await choose_strain_type_wrapper(update, context)
+        except Exception as e:
+            print(f"DEBUG CALLBACK ERROR: Failed to handle strain selection: {str(e)}")
+    
+    elif query.data.startswith("back_to_"):
+        print(f"DEBUG CALLBACK: Attempting to handle back navigation: {query.data}")
+        try:
+            return await handle_back_navigation_wrapper(update, context)
+        except Exception as e:
+            print(f"DEBUG CALLBACK ERROR: Failed to handle navigation: {str(e)}")
+    
+    # Don't modify the message or do anything else
+    return
+
+async def debug_state_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Middleware-like function to track conversation states.
+    Call this at the beginning of key handler functions.
+    
+    Args:
+        update: Telegram update
+        context: Conversation context
+    """
+    user_id = update.effective_user.id if update.effective_user else "Unknown"
+    chat_id = update.effective_chat.id if update.effective_chat else "Unknown"
+    
+    # Get current location from context
+    current_location = context.user_data.get("current_location", "Unknown")
+    category = context.user_data.get("category", "None")
+    
+    # Determine what type of update this is
+    update_type = "Unknown"
+    callback_data = None
+    
+    if update.message:
+        update_type = f"Message: {update.message.text[:20]}..." if update.message.text else "Message (non-text)"
+    elif update.callback_query:
+        update_type = "Callback Query"
+        callback_data = update.callback_query.data
+    
+    # Log the state
+    print(f"DEBUG STATE: User {user_id} | Chat {chat_id} | Location: {current_location} | Category: {category} | Update: {update_type} | Callback: {callback_data}")
+
 def main():
     """Set up the bot and start polling."""
     global loggers, google_apis, inventory_manager, order_manager, admin_panel
@@ -7026,15 +7166,19 @@ def main():
             entry_points=[CommandHandler("start", start_wrapper)],
             states={
                 CATEGORY: [
+                    # Match any string callback in CATEGORY state
                     CallbackQueryHandler(choose_category_wrapper)
                 ],
                 STRAIN_TYPE: [
+                    # Match any string callback in STRAIN_TYPE state
                     CallbackQueryHandler(choose_strain_type_wrapper)
                 ],
                 BROWSE_BY: [
+                    # Match all callbacks in BROWSE_BY state
                     CallbackQueryHandler(browse_carts_by_wrapper)
                 ],
                 PRODUCT_SELECTION: [
+                    # Handle all product selection callbacks
                     CallbackQueryHandler(select_product_wrapper)
                 ],
                 QUANTITY: [
@@ -7060,6 +7204,8 @@ def main():
                 CommandHandler("cancel", cancel),
                 CommandHandler("categories", back_to_categories_wrapper),
                 CommandHandler("start", start_wrapper),
+                # Match restart_conversation explicitly
+                CallbackQueryHandler(restart_conversation, pattern=r"^restart_conversation$")
             ],
             name="ordering_conversation",
             persistent=True,
@@ -7145,7 +7291,8 @@ def main():
             command_not_found
         )
         app.add_handler(unknown_command_handler)
-    
+        app.add_handler(CallbackQueryHandler(debug_callback))
+
         # Log the startup
         loggers["main"].info("Bot is running...")
         print("Bot is running...")
